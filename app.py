@@ -56,7 +56,7 @@ extra_days_input = st.number_input(
 
 # Динамическая подсказка
 if st.session_state["overnight"]:
-    st.markdown("<span style='color:gray'>Дополнительные дни отключены при включенном Overnight</span>", unsafe_allow_html=True)
+    #st.markdown("<span style='color:gray'>Дополнительные дни отключены при включенном Overnight</span>", unsafe_allow_html=True)
 
 # Расчёт days_threshold
 days_threshold = 3 if st.session_state["overnight"] else 1 + st.session_state["extra_days"]
