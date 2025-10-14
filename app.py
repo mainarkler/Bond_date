@@ -195,7 +195,7 @@ if uploaded_file:
         st.session_state["last_file_name"] = uploaded_file.name
 
         status_area = st.empty()
-        status_area.info("🔍 Этап 1: поиск через стандартное API...")
+        status_area.info("🔍 Поиск корп. облигаций")
 
         if uploaded_file.name.endswith(".csv"):
             df = pd.read_csv(uploaded_file)
@@ -224,7 +224,7 @@ if uploaded_file:
 
         # === Этап 2 ===
         if unfound:
-            status_area.info("🔍 Этап 2: поиск оставшихся через общий список (ОФЗ)...")
+            status_area.info("🔍 Поиск ОФЗ")
             for idx, isin in enumerate(unfound, start=1):
                 data = get_bond_data(isin)
                 if data:
@@ -253,4 +253,4 @@ if st.session_state["results"] is not None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 else:
-    st.info("👆 Загрузите файл с ISIN для начала.")
+    st.info("👆 Загрузите файл с ISIN")
