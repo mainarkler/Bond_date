@@ -61,7 +61,7 @@ if st.session_state["overnight"]:
 # Расчёт days_threshold
 days_threshold = 3 if st.session_state["overnight"] else 1 + st.session_state["extra_days"]
 
-st.write(f"Текущее значение границы подсветки: {days_threshold} дн.")
+st.write(f"Текущее значение границы выплат: {days_threshold} дн.")
 
 # === Функция получения SECID (для ОФЗ и нестандартных инструментов) ===
 def get_secid(isin):
