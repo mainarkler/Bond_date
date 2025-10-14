@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 
 st.set_page_config(page_title="Обработка ISIN", page_icon="📈", layout="wide")
-st.title("📈 Получение данных по ISIN с MOEX")
+st.title("📈 РЕПО претрейд")
 
 # === Session state для сохранения данных между действиями ===
 if "results" not in st.session_state:
@@ -16,7 +16,7 @@ if "last_file_name" not in st.session_state:
     st.session_state["last_file_name"] = None
 
 # === Настройки подсветки ===
-st.subheader("⚙️ Настройки выделения дат")
+st.subheader("⚙️ Настройки длительности РЕПО")
 
 # Инициализация session_state по умолчанию
 if "overnight" not in st.session_state:
@@ -40,13 +40,13 @@ if st.button("🔄 Очистить форму"):
 
 # Overnight чекбокс
 overnight = st.checkbox(
-    "Overnight (3 дня)",
+    "Overnight РЕПО",
     key="overnight",
 )
 
 # Дополнительные дни
 extra_days_input = st.number_input(
-    "Дополнительные дни (2–366):",
+    "Дней РЕПО:",
     min_value=2,
     max_value=366,
     step=1,
