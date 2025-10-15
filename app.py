@@ -7,7 +7,7 @@ from io import BytesIO
 st.set_page_config(page_title="Обработка ISIN", page_icon="📈", layout="wide")
 st.title("📈 РЕПО претрейд")
 
-# === Session state для сохранения данных между действиями ===
+# === Session state ===
 if "results" not in st.session_state:
     st.session_state["results"] = None
 if "file_loaded" not in st.session_state:
@@ -15,55 +15,39 @@ if "file_loaded" not in st.session_state:
 if "last_file_name" not in st.session_state:
     st.session_state["last_file_name"] = None
 
-# === Настройки подсветки ===
+# === Настройки длительности РЕПО ===
 st.subheader("⚙️ Настройки длительности РЕПО")
 
-# Инициализация session_state по умолчанию
 if "overnight" not in st.session_state:
     st.session_state["overnight"] = False
 if "extra_days" not in st.session_state:
     st.session_state["extra_days"] = 2
 
-# === Очистка данных и формы настроек ===
 if st.button("🔄 Очистить форму"):
-    # Сброс формы настроек
     st.session_state["overnight"] = False
     st.session_state["extra_days"] = 2
-
-    # Сброс данных и файла
     st.session_state["results"] = None
     st.session_state["file_loaded"] = False
     st.session_state["last_file_name"] = None
-
-    # Перезапуск приложения, чтобы виджеты обновились
     st.rerun()
 
-# Overnight чекбокс
-overnight = st.checkbox(
-    "Overnight РЕПО",
-    key="overnight",
-)
-
-# Дополнительные дни
+overnight = st.checkbox("Overnight РЕПО", key="overnight")
 extra_days_input = st.number_input(
     "Дней РЕПО:",
     min_value=2,
     max_value=366,
     step=1,
     disabled=st.session_state["overnight"],
-    key="extra_days",  # значение берётся из session_state
+    key="extra_days",
 )
 
-# Динамическая подсказка
 if st.session_state["overnight"]:
     st.markdown("<span style='color:gray'>Дополнительные дни отключены при включенном Overnight</span>", unsafe_allow_html=True)
 
-# Расчёт days_threshold
 days_threshold = 3 if st.session_state["overnight"] else 1 + st.session_state["extra_days"]
-
 st.write(f"Текущее значение границы выплат: {days_threshold} дн.")
 
-# === Функция получения SECID (для ОФЗ и нестандартных инструментов) ===
+# === Получение SECID ===
 def get_secid(isin):
     url = f"https://iss.moex.com/iss/securities.json?q={isin}"
     try:
@@ -77,17 +61,16 @@ def get_secid(isin):
     except Exception:
         return None
 
-# === Основная функция получения данных по ISIN ===
+# === Получение данных по ISIN ===
 def get_bond_data(isin):
     try:
-        # --- Попытка 1: стандартное API ---
         url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{isin}.json"
         response_info = requests.get(url_info, timeout=10)
+
         if response_info.status_code == 200:
             data_info = response_info.json()
             rows_info = data_info.get("securities", {}).get("data", [])
             columns_info = data_info.get("securities", {}).get("columns", [])
-
             if rows_info:
                 info_dict = dict(zip(columns_info, rows_info[0]))
                 secname = info_dict.get("SECNAME")
@@ -96,7 +79,7 @@ def get_bond_data(isin):
                 call_date = info_dict.get("CALLOPTIONDATE")
             else:
                 raise ValueError("Нет данных по ISIN")
-        # --- Попытка 2: общий список (ОФЗ) ---
+
         else:
             secid = get_secid(isin)
             if not secid:
@@ -116,7 +99,7 @@ def get_bond_data(isin):
             else:
                 return None
 
-        # --- Даты купонов ---
+        # --- Купоны ---
         url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{isin}.json?iss.only=coupons&iss.meta=off"
         response_coupons = requests.get(url_coupons, timeout=10)
         response_coupons.raise_for_status()
@@ -124,6 +107,7 @@ def get_bond_data(isin):
         coupons = data_coupons.get("coupons", {}).get("data", [])
         columns_coupons = data_coupons.get("coupons", {}).get("columns", [])
 
+        record_date = coupon_date = None
         if coupons:
             df_coupons = pd.DataFrame(coupons, columns=columns_coupons)
             today = pd.to_datetime(datetime.today().date())
@@ -137,8 +121,6 @@ def get_bond_data(isin):
 
             record_date = next_date("recorddate")
             coupon_date = next_date("coupondate")
-        else:
-            record_date = coupon_date = None
 
         def fmt(date):
             if pd.isna(date) or not date:
@@ -159,10 +141,22 @@ def get_bond_data(isin):
         }
 
     except Exception:
-        return None
+        # Возврат "пустой" записи, если данные не найдены
+        return {
+            "Оригинальный ISIN": isin,
+            "Наименование инструмента": "Не найдено",
+            "Дата погашения": None,
+            "Дата оферты Put": None,
+            "Дата оферты Call": None,
+            "Дата фиксации купона": None,
+            "Дата купона": None,
+        }
 
-# === Стили таблицы ===
+# === Стилизация таблицы ===
 def style_df(row):
+    if row["Наименование инструмента"] == "Не найдено":
+        return ["background-color: DimGray; color: white"] * len(row)
+
     today = datetime.today().date()
     danger_threshold = today + timedelta(days=days_threshold)
     key_dates = [
@@ -172,8 +166,6 @@ def style_df(row):
         "Дата фиксации купона",
         "Дата купона",
     ]
-    if all(pd.isna(row[col]) for col in key_dates):
-        return ["background-color: DimGray"] * len(row)
     colors = ["" for _ in row]
     for i, col in enumerate(row.index):
         if col in key_dates and pd.notnull(row[col]):
@@ -195,7 +187,7 @@ if uploaded_file:
         st.session_state["last_file_name"] = uploaded_file.name
 
         status_area = st.empty()
-        status_area.info("🔍 Поиск корп. облигаций")
+        status_area.info("🔍 Обработка ISIN...")
 
         if uploaded_file.name.endswith(".csv"):
             df = pd.read_csv(uploaded_file)
@@ -208,34 +200,18 @@ if uploaded_file:
 
         isins = df["ISIN"].dropna().unique().tolist()
         results = []
-        unfound = []
         progress_bar = st.progress(0)
 
-        # === Этап 1 ===
         for idx, isin in enumerate(isins, start=1):
             data = get_bond_data(isin)
-            if data:
-                results.append(data)
-            else:
-                unfound.append(isin)
+            results.append(data)
             progress_bar.progress(idx / len(isins))
 
-        status_area.info(f"✅ Найдено {len(results)} инструментов. Осталось {len(unfound)} для дополнительной проверки.")
-
-        # === Этап 2 ===
-        if unfound:
-            status_area.info("🔍 Поиск ОФЗ")
-            for idx, isin in enumerate(unfound, start=1):
-                data = get_bond_data(isin)
-                if data:
-                    results.append(data)
-
-        # --- Финальные данные ---
         st.session_state["results"] = pd.DataFrame(results)
         status_area.empty()
-        st.success("✅ Данные успешно получены!")
+        st.success("✅ Обработка завершена!")
 
-# === Вывод таблицы ===
+# === Вывод ===
 if st.session_state["results"] is not None:
     styled_df = st.session_state["results"].style.apply(style_df, axis=1)
     st.dataframe(styled_df, use_container_width=True)
