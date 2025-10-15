@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 from datetime import datetime, timedelta
 from io import BytesIO
+import os
 
 st.set_page_config(page_title="Обработка ISIN", page_icon="📈", layout="wide")
 st.title("📈 РЕПО претрейд")
@@ -17,7 +18,6 @@ if "last_file_name" not in st.session_state:
 
 # === Настройки длительности РЕПО ===
 st.subheader("⚙️ Настройки длительности РЕПО")
-
 if "overnight" not in st.session_state:
     st.session_state["overnight"] = False
 if "extra_days" not in st.session_state:
@@ -47,7 +47,7 @@ if st.session_state["overnight"]:
 days_threshold = 3 if st.session_state["overnight"] else 1 + st.session_state["extra_days"]
 st.write(f"Текущее значение границы выплат: {days_threshold} дн.")
 
-# === Получение SECID ===
+# === Функции MOEX ===
 def get_secid(isin):
     url = f"https://iss.moex.com/iss/securities.json?q={isin}"
     try:
@@ -61,12 +61,11 @@ def get_secid(isin):
     except Exception:
         return None
 
-# === Получение данных по ISIN ===
 def get_bond_data(isin):
+    """Возвращает словарь с данными облигации. Если не найдено, возвращает с secname='Не найдено'."""
     try:
         url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{isin}.json"
         response_info = requests.get(url_info, timeout=10)
-
         if response_info.status_code == 200:
             data_info = response_info.json()
             rows_info = data_info.get("securities", {}).get("data", [])
@@ -79,11 +78,10 @@ def get_bond_data(isin):
                 call_date = info_dict.get("CALLOPTIONDATE")
             else:
                 raise ValueError("Нет данных по ISIN")
-
         else:
             secid = get_secid(isin)
             if not secid:
-                return None
+                raise ValueError("ISIN не найден")
             url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
             response_info = requests.get(url_info, timeout=10)
             response_info.raise_for_status()
@@ -97,9 +95,9 @@ def get_bond_data(isin):
                 put_date = info_dict.get("PUTOPTIONDATE")
                 call_date = info_dict.get("CALLOPTIONDATE")
             else:
-                return None
+                raise ValueError("Нет данных по ISIN")
 
-        # --- Купоны ---
+        # Купоны
         url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{isin}.json?iss.only=coupons&iss.meta=off"
         response_coupons = requests.get(url_coupons, timeout=10)
         response_coupons.raise_for_status()
@@ -111,14 +109,12 @@ def get_bond_data(isin):
         if coupons:
             df_coupons = pd.DataFrame(coupons, columns=columns_coupons)
             today = pd.to_datetime(datetime.today().date())
-
             def next_date(col):
                 if col in df_coupons:
                     future_dates = pd.to_datetime(df_coupons[col], errors="coerce")
                     future_dates = future_dates[future_dates >= today]
                     return future_dates.min() if not future_dates.empty else None
                 return None
-
             record_date = next_date("recorddate")
             coupon_date = next_date("coupondate")
 
@@ -141,7 +137,6 @@ def get_bond_data(isin):
         }
 
     except Exception:
-        # Возврат "пустой" записи, если данные не найдены
         return {
             "Оригинальный ISIN": isin,
             "Наименование инструмента": "Не найдено",
@@ -152,20 +147,53 @@ def get_bond_data(isin):
             "Дата купона": None,
         }
 
-# === Стилизация таблицы ===
+# === Рейтинг и Limit ===
+STOP_WORDS = {'банк','групп','группа','республика','министерство','финансов','inc','ltd','corp'}
+
+def get_bond_names(isin):
+    try:
+        url = f"https://iss.moex.com/iss/securities/{isin}.json?iss.meta=off"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        name = shortname = None
+        for item in data.get('description', {}).get('data', []):
+            if item[0] == 'NAME': name = item[2]
+            if item[0] == 'SHORTNAME': shortname = item[2]
+        return name, shortname
+    except Exception:
+        return None, None
+
+def filter_words(text):
+    return set(word.lower() for word in str(text).split() if word.lower() not in STOP_WORDS)
+
+def find_rating(name, shortname, csv_path):
+    if not os.path.exists(csv_path): return None
+    df = pd.read_csv(csv_path, sep='\t')
+    name_words = filter_words(name)
+    shortname_words = filter_words(shortname)
+    for _, row in df.iterrows():
+        issuer_words = filter_words(row['Issuer'])
+        if name_words & issuer_words or shortname_words & issuer_words:
+            return row['Rating']
+    return None
+
+def determine_limit(secname, rating):
+    if secname == "Не найдено": return 0
+    if "ОФЗ" in str(secname).upper(): return 100
+    try: rating = int(rating)
+    except: rating = None
+    if rating is None: return 0
+    if rating >= 12: return 25
+    elif 12 > rating >= 18: return 15
+    else: return 0
+
+# === Стилизация ===
 def style_df(row):
     if row["Наименование инструмента"] == "Не найдено":
         return ["background-color: DimGray; color: white"] * len(row)
-
     today = datetime.today().date()
     danger_threshold = today + timedelta(days=days_threshold)
-    key_dates = [
-        "Дата погашения",
-        "Дата оферты Put",
-        "Дата оферты Call",
-        "Дата фиксации купона",
-        "Дата купона",
-    ]
+    key_dates = ["Дата погашения","Дата оферты Put","Дата оферты Call","Дата фиксации купона","Дата купона"]
     colors = ["" for _ in row]
     for i, col in enumerate(row.index):
         if col in key_dates and pd.notnull(row[col]):
@@ -173,27 +201,22 @@ def style_df(row):
                 d = pd.to_datetime(row[col]).date()
                 if d <= danger_threshold:
                     colors[i] = "background-color: Chocolate"
-            except Exception:
-                pass
+            except: pass
     if any(c == "background-color: Chocolate" for c in colors):
         colors = ["background-color: SandyBrown" if c == "" else c for c in colors]
     return colors
 
 # === Загрузка файла ===
-uploaded_file = st.file_uploader("Загрузите Excel или CSV с колонкой ISIN:", type=["xlsx", "xls", "csv"])
+uploaded_file = st.file_uploader("Загрузите Excel или CSV с колонкой ISIN:", type=["xlsx","xls","csv"])
 if uploaded_file:
     if not st.session_state["file_loaded"] or uploaded_file.name != st.session_state["last_file_name"]:
         st.session_state["file_loaded"] = True
         st.session_state["last_file_name"] = uploaded_file.name
-
         status_area = st.empty()
         status_area.info("🔍 Обработка ISIN...")
 
-        if uploaded_file.name.endswith(".csv"):
-            df = pd.read_csv(uploaded_file)
-        else:
-            df = pd.read_excel(uploaded_file)
-
+        if uploaded_file.name.endswith(".csv"): df = pd.read_csv(uploaded_file)
+        else: df = pd.read_excel(uploaded_file)
         if "ISIN" not in df.columns:
             st.error("❌ В файле должна быть колонка 'ISIN'.")
             st.stop()
@@ -203,11 +226,24 @@ if uploaded_file:
         progress_bar = st.progress(0)
 
         for idx, isin in enumerate(isins, start=1):
-            data = get_bond_data(isin)
-            results.append(data)
+            results.append(get_bond_data(isin))
             progress_bar.progress(idx / len(isins))
 
         st.session_state["results"] = pd.DataFrame(results)
+
+        # --- Рейтинг и Limit ---
+        csv_path = r"C:\Desktop\code\App\scor.csv"
+        ratings = []
+        limits = []
+        for _, row in st.session_state["results"].iterrows():
+            name, shortname = get_bond_names(row["Оригинальный ISIN"])
+            rating = find_rating(name, shortname, csv_path)
+            limit = determine_limit(row["Наименование инструмента"], rating)
+            ratings.append(rating)
+            limits.append(limit)
+        st.session_state["results"]["Rating"] = ratings
+        st.session_state["results"]["Limit"] = limits
+
         status_area.empty()
         st.success("✅ Обработка завершена!")
 
