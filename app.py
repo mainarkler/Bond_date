@@ -1,11 +1,14 @@
 import streamlit as st
 import pandas as pd
 import requests
+import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
-from io import BytesIO
+from io import BytesIO, StringIO
 import os
+import csv
 
-st.set_page_config(page_title="Обработка ISIN", page_icon="📈", layout="wide")
+st.set_page_config(page_title="РЕПО претрейд risc's", page_icon="📈", layout="wide")
 st.title("📈 РЕПО претрейд")
 
 # === Session state ===
@@ -16,19 +19,16 @@ if "file_loaded" not in st.session_state:
 if "last_file_name" not in st.session_state:
     st.session_state["last_file_name"] = None
 
-# === Настройки длительности РЕПО ===
+# === Настройки ===
 st.subheader("⚙️ Настройки длительности РЕПО")
+
 if "overnight" not in st.session_state:
     st.session_state["overnight"] = False
 if "extra_days" not in st.session_state:
     st.session_state["extra_days"] = 2
 
 if st.button("🔄 Очистить форму"):
-    st.session_state["overnight"] = False
-    st.session_state["extra_days"] = 2
-    st.session_state["results"] = None
-    st.session_state["file_loaded"] = False
-    st.session_state["last_file_name"] = None
+    st.session_state.clear()
     st.rerun()
 
 overnight = st.checkbox("Overnight РЕПО", key="overnight")
@@ -42,92 +42,182 @@ extra_days_input = st.number_input(
 )
 
 if st.session_state["overnight"]:
-    st.markdown("<span style='color:gray'>Дополнительные дни отключены при включенном Overnight</span>", unsafe_allow_html=True)
+    st.markdown(
+        "<span style='color:gray'>Дополнительные дни отключены при включенном Overnight</span>",
+        unsafe_allow_html=True,
+    )
 
 days_threshold = 3 if st.session_state["overnight"] else 1 + st.session_state["extra_days"]
 st.write(f"Текущее значение границы выплат: {days_threshold} дн.")
 
-# === Функции MOEX ===
-def get_secid(isin):
-    url = f"https://iss.moex.com/iss/securities.json?q={isin}"
+# === Безопасное чтение CSV ===
+def safe_read_csv(path):
+    if not os.path.exists(path):
+        st.warning(f"⚠️ Файл не найден: {path}")
+        return pd.DataFrame()
     try:
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        if data.get("securities", {}).get("data"):
-            for row in data["securities"]["data"]:
-                if "TQCB" in row:
-                    return row[0]
-        return None
-    except Exception:
-        return None
+        with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
+            content = f.read().replace('"', '').replace("'", "")
+            sample = content[:2048]
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t"])
+                sep = dialect.delimiter
+            except Exception:
+                sep = ","
+        df = pd.read_csv(StringIO(content), sep=sep, dtype=str, on_bad_lines="skip")
+        df.columns = [c.strip().upper() for c in df.columns]
+        return df
+    except Exception as e:
+        st.warning(f"⚠️ Ошибка при чтении файла {os.path.basename(path)}: {e}")
+        return pd.DataFrame()
 
-def get_bond_data(isin):
-    """Возвращает словарь с данными облигации. Если не найдено, возвращает с secname='Не найдено'."""
+# === Загрузка справочников ===
+EMITTER_FILE = r"C:\Desktop\code\App\Pifagr_name_with_emitter.csv"
+RATING_FILE = r"C:\Desktop\code\App\scor.csv"
+
+df_emitters = safe_read_csv(EMITTER_FILE)
+df_rating = safe_read_csv(RATING_FILE)
+
+if not df_rating.empty:
+    if {"RATING", "ISSUER"}.issubset(df_rating.columns):
+        df_rating["RATING"] = pd.to_numeric(df_rating["RATING"], errors="coerce")
+    else:
+        st.warning("⚠️ В файле рейтингов должны быть колонки 'Rating' и 'Issuer'")
+
+# === MOEX session ===
+session = requests.Session()
+session.headers.update({"User-Agent": "python-requests/iss-moex-emitter-id-script"})
+
+def fetch_emitter_id(isin: str):
+    isin = str(isin).strip()
+    if not isin:
+        return None
+    # JSON
     try:
+        url = f"https://iss.moex.com/iss/securities/{isin}.json"
+        r = session.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        securities = data.get("securities", {})
+        cols = securities.get("columns", [])
+        rows = securities.get("data", [])
+        if rows:
+            for i, c in enumerate(cols):
+                if c.upper() == "EMITTER_ID":
+                    return rows[0][i]
+    except Exception:
+        pass
+    # XML резерв
+    try:
+        url = f"https://iss.moex.com/iss/securities/{isin}.xml?iss.meta=off"
+        r = session.get(url, timeout=10)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        for row in root.iter():
+            name_attr = row.attrib.get("name") or row.attrib.get("NAME")
+            if name_attr and name_attr.upper() == "EMITTER_ID":
+                return row.attrib.get("value") or row.attrib.get("VALUE")
+    except Exception:
+        pass
+    return None
+
+# === Получение данных об облигации ===
+def get_bond_data(isin):
+    try:
+        emitter_id = fetch_emitter_id(isin)
+        emitter_name = None
+
+        # Эмитент
+        if emitter_id and not df_emitters.empty:
+            match = df_emitters[df_emitters["EMITTER_ID"] == str(emitter_id)]
+            if not match.empty and "ISSUER" in match.columns:
+                emitter_name = match.iloc[0]["ISSUER"]
+
+        # Рейтинг
+        rating = None
+        if emitter_name and not df_rating.empty:
+            match_r = df_rating[
+                df_rating["ISSUER"].str.strip().str.lower() == emitter_name.strip().lower()
+            ]
+            if not match_r.empty:
+                rating = match_r.iloc[0]["RATING"]
+
+        # Лимит
+        if emitter_name == "МИНФИН РОССИИ":
+            limit = "100%"
+        else:
+            try:
+                r = float(rating)
+                if r >= 18:
+                    limit = "25%"
+                elif 12 <= r < 18:
+                    limit = "15%"
+                else:
+                    limit = "0%"
+            except:
+                limit = "0%"
+
+        # Информация о бумаге
         url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{isin}.json"
         response_info = requests.get(url_info, timeout=10)
+        secname = maturity_date = put_date = call_date = None
         if response_info.status_code == 200:
             data_info = response_info.json()
             rows_info = data_info.get("securities", {}).get("data", [])
             columns_info = data_info.get("securities", {}).get("columns", [])
             if rows_info:
                 info_dict = dict(zip(columns_info, rows_info[0]))
-                secname = info_dict.get("SECNAME")
+                secname = info_dict.get("SECNAME", "Не найдено")
                 maturity_date = info_dict.get("MATDATE")
                 put_date = info_dict.get("PUTOPTIONDATE")
                 call_date = info_dict.get("CALLOPTIONDATE")
-            else:
-                raise ValueError("Нет данных по ISIN")
-        else:
-            secid = get_secid(isin)
-            if not secid:
-                raise ValueError("ISIN не найден")
-            url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
-            response_info = requests.get(url_info, timeout=10)
-            response_info.raise_for_status()
-            data_info = response_info.json()
-            rows_info = data_info.get("securities", {}).get("data", [])
-            columns_info = data_info.get("securities", {}).get("columns", [])
-            if rows_info:
-                info_dict = dict(zip(columns_info, rows_info[0]))
-                secname = info_dict.get("SECNAME")
-                maturity_date = info_dict.get("MATDATE")
-                put_date = info_dict.get("PUTOPTIONDATE")
-                call_date = info_dict.get("CALLOPTIONDATE")
-            else:
-                raise ValueError("Нет данных по ISIN")
 
         # Купоны
-        url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{isin}.json?iss.only=coupons&iss.meta=off"
-        response_coupons = requests.get(url_coupons, timeout=10)
-        response_coupons.raise_for_status()
-        data_coupons = response_coupons.json()
-        coupons = data_coupons.get("coupons", {}).get("data", [])
-        columns_coupons = data_coupons.get("coupons", {}).get("columns", [])
+        url_coupons = (
+            f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{isin}.json"
+            f"?iss.only=coupons&iss.meta=off"
+        )
+        try:
+            response_coupons = requests.get(url_coupons, timeout=10)
+            response_coupons.raise_for_status()
+            data_coupons = response_coupons.json()
+            coupons = data_coupons.get("coupons", {}).get("data", [])
+            columns_coupons = data_coupons.get("coupons", {}).get("columns", [])
+            record_date = coupon_date = None
 
-        record_date = coupon_date = None
-        if coupons:
-            df_coupons = pd.DataFrame(coupons, columns=columns_coupons)
-            today = pd.to_datetime(datetime.today().date())
-            def next_date(col):
-                if col in df_coupons:
-                    future_dates = pd.to_datetime(df_coupons[col], errors="coerce")
-                    future_dates = future_dates[future_dates >= today]
-                    return future_dates.min() if not future_dates.empty else None
-                return None
-            record_date = next_date("recorddate")
-            coupon_date = next_date("coupondate")
+            if coupons:
+                df_coupons = pd.DataFrame(coupons, columns=columns_coupons)
+                today = pd.to_datetime(datetime.today().date())
 
+                def next_date(col):
+                    if col in df_coupons:
+                        future_dates = pd.to_datetime(df_coupons[col], errors="coerce")
+                        future_dates = future_dates[future_dates >= today]
+                        return future_dates.min() if not future_dates.empty else None
+                    return None
+
+                record_date = next_date("recorddate")
+                coupon_date = next_date("coupondate")
+            else:
+                record_date = coupon_date = None
+        except Exception:
+            record_date = coupon_date = None
+
+        # Форматирование
         def fmt(date):
             if pd.isna(date) or not date:
                 return None
             try:
                 return pd.to_datetime(date).strftime("%Y-%m-%d")
-            except Exception:
+            except:
                 return None
 
         return {
-            "Оригинальный ISIN": isin,
+            "ISIN": isin,
+            "Код эмитента": emitter_id,
+            "Наименование эмитента": emitter_name,
+            "Рейтинг": rating,
+            "Лимит": limit,
             "Наименование инструмента": secname,
             "Дата погашения": fmt(maturity_date),
             "Дата оферты Put": fmt(put_date),
@@ -136,87 +226,22 @@ def get_bond_data(isin):
             "Дата купона": fmt(coupon_date),
         }
 
-    except Exception:
-        return {
-            "Оригинальный ISIN": isin,
-            "Наименование инструмента": "Не найдено",
-            "Дата погашения": None,
-            "Дата оферты Put": None,
-            "Дата оферты Call": None,
-            "Дата фиксации купона": None,
-            "Дата купона": None,
-        }
+    except Exception as e:
+        st.warning(f"Ошибка при обработке {isin}: {e}")
+        return None
 
-# === Рейтинг и Limit ===
-STOP_WORDS = {'банк','групп','группа','республика','министерство','финансов','inc','ltd','corp'}
+# === Основная логика загрузки ===
+uploaded_file = st.file_uploader("Загрузите Excel или CSV с колонкой ISIN:", type=["xlsx", "xls", "csv"])
 
-def get_bond_names(isin):
-    try:
-        url = f"https://iss.moex.com/iss/securities/{isin}.json?iss.meta=off"
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        name = shortname = None
-        for item in data.get('description', {}).get('data', []):
-            if item[0] == 'NAME': name = item[2]
-            if item[0] == 'SHORTNAME': shortname = item[2]
-        return name, shortname
-    except Exception:
-        return None, None
-
-def filter_words(text):
-    return set(word.lower() for word in str(text).split() if word.lower() not in STOP_WORDS)
-
-def find_rating(name, shortname, csv_path):
-    if not os.path.exists(csv_path): return None
-    df = pd.read_csv(csv_path, sep='\t')
-    name_words = filter_words(name)
-    shortname_words = filter_words(shortname)
-    for _, row in df.iterrows():
-        issuer_words = filter_words(row['Issuer'])
-        if name_words & issuer_words or shortname_words & issuer_words:
-            return row['Rating']
-    return None
-
-def determine_limit(secname, rating):
-    if secname == "Не найдено": return 0
-    if "ОФЗ" in str(secname).upper(): return 100
-    try: rating = int(rating)
-    except: rating = None
-    if rating is None: return 0
-    if rating >= 12: return 25
-    elif 12 > rating >= 18: return 15
-    else: return 0
-
-# === Стилизация ===
-def style_df(row):
-    if row["Наименование инструмента"] == "Не найдено":
-        return ["background-color: DimGray; color: white"] * len(row)
-    today = datetime.today().date()
-    danger_threshold = today + timedelta(days=days_threshold)
-    key_dates = ["Дата погашения","Дата оферты Put","Дата оферты Call","Дата фиксации купона","Дата купона"]
-    colors = ["" for _ in row]
-    for i, col in enumerate(row.index):
-        if col in key_dates and pd.notnull(row[col]):
-            try:
-                d = pd.to_datetime(row[col]).date()
-                if d <= danger_threshold:
-                    colors[i] = "background-color: Chocolate"
-            except: pass
-    if any(c == "background-color: Chocolate" for c in colors):
-        colors = ["background-color: SandyBrown" if c == "" else c for c in colors]
-    return colors
-
-# === Загрузка файла ===
-uploaded_file = st.file_uploader("Загрузите Excel или CSV с колонкой ISIN:", type=["xlsx","xls","csv"])
 if uploaded_file:
     if not st.session_state["file_loaded"] or uploaded_file.name != st.session_state["last_file_name"]:
         st.session_state["file_loaded"] = True
         st.session_state["last_file_name"] = uploaded_file.name
-        status_area = st.empty()
-        status_area.info("🔍 Обработка ISIN...")
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file, dtype=str)
+        else:
+            df = pd.read_excel(uploaded_file, dtype=str)
 
-        if uploaded_file.name.endswith(".csv"): df = pd.read_csv(uploaded_file)
-        else: df = pd.read_excel(uploaded_file)
         if "ISIN" not in df.columns:
             st.error("❌ В файле должна быть колонка 'ISIN'.")
             st.stop()
@@ -226,31 +251,61 @@ if uploaded_file:
         progress_bar = st.progress(0)
 
         for idx, isin in enumerate(isins, start=1):
-            results.append(get_bond_data(isin))
+            data = get_bond_data(isin)
+            if data:
+                results.append(data)
             progress_bar.progress(idx / len(isins))
+            time.sleep(0.05)
 
         st.session_state["results"] = pd.DataFrame(results)
+        st.success("✅ Данные успешно получены!")
 
-        # --- Рейтинг и Limit ---
-        csv_path = r"C:\Desktop\code\App\scor.csv"
-        ratings = []
-        limits = []
-        for _, row in st.session_state["results"].iterrows():
-            name, shortname = get_bond_names(row["Оригинальный ISIN"])
-            rating = find_rating(name, shortname, csv_path)
-            limit = determine_limit(row["Наименование инструмента"], rating)
-            ratings.append(rating)
-            limits.append(limit)
-        st.session_state["results"]["Rating"] = ratings
-        st.session_state["results"]["Limit"] = limits
+# === Стилизация ===
+def style_df(row):
+    # Определяем, какие поля считаем "ключевыми"
+    key_fields = [
+        "Наименование инструмента",
+        "Наименование эмитента",
+        "Дата погашения",
+        "Дата оферты Put",
+        "Дата оферты Call",
+        "Дата фиксации купона",
+        "Дата купона"
+    ]
 
-        status_area.empty()
-        st.success("✅ Обработка завершена!")
+    # Проверяем: если все ключевые поля пустые или None
+    empty = all(pd.isna(row.get(col)) or str(row.get(col)).strip() in ["", "None", "nan"] for col in key_fields)
 
-# === Вывод ===
+    if empty:
+        return ["background-color: DimGray; color: white"] * len(row)
+
+    # Если инструмент явно "Не найдено"
+    if str(row.get("Наименование инструмента")).strip() == "Не найдено":
+        return ["background-color: DimGray; color: white"] * len(row)
+
+    # === Логика выделения по дате ===
+    today = datetime.today().date()
+    danger_threshold = today + timedelta(days=days_threshold)
+    key_dates = ["Дата погашения", "Дата оферты Put", "Дата оферты Call", "Дата фиксации купона", "Дата купона"]
+    colors = ["" for _ in row]
+
+    for i, col in enumerate(row.index):
+        if col in key_dates and pd.notnull(row[col]):
+            try:
+                d = pd.to_datetime(row[col]).date()
+                if d <= danger_threshold:
+                    colors[i] = "background-color: Chocolate"
+            except:
+                pass
+
+    if any(c == "background-color: Chocolate" for c in colors):
+        colors = ["background-color: SandyBrown" if c == "" else c for c in colors]
+
+    return colors
+
 if st.session_state["results"] is not None:
-    styled_df = st.session_state["results"].style.apply(style_df, axis=1)
-    st.dataframe(styled_df, use_container_width=True)
+    df_res = st.session_state["results"]
+    st.dataframe(df_res.style.apply(style_df, axis=1), use_container_width=True)
 
     def to_excel(df):
         output = BytesIO()
@@ -260,8 +315,8 @@ if st.session_state["results"] is not None:
 
     st.download_button(
         label="💾 Скачать результат (Excel)",
-        data=to_excel(st.session_state["results"]),
-        file_name="bond_data.xlsx",
+        data=to_excel(df_res),
+        file_name="bond_data_with_limits.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 else:
