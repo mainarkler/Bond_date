@@ -8,6 +8,7 @@ from io import BytesIO, StringIO
 import os
 import csv
 import re
+import openpyxl
 
 # === Настройки страницы ===
 st.set_page_config(page_title="РЕПО претрейд risc's", page_icon="📈", layout="wide")
@@ -80,7 +81,7 @@ def safe_read_csv(path):
         return pd.DataFrame()
 
 # === Загрузка справочников ===
-EMITTER_FILE = r"C:\Desktop\code\App\Pifagr_name_with_emitter.csv"
+EMITTER_FILE = "https://github.com/mainarkler/Bond_date/raw/refs/heads/main/Pifagr_name_with_emitter.csv"
 RATING_FILE = r"C:\Desktop\code\App\scor.csv"
 
 df_emitters = safe_read_csv(EMITTER_FILE)
