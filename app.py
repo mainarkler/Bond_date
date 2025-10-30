@@ -132,7 +132,19 @@ def fetch_emitter_id(isin: str, issuer_name: str = None):
 # === Получение данных по ISIN ===
 def get_bond_data(isin):
     try:
-        emitter_id = None
+        # --- Попытка найти эмитента через справочник ---
+        emitter_id = fetch_emitter_id(isin)
+        emitter_name = None
+        if emitter_id and not df_emitters.empty:
+            match = df_emitters[df_emitters["EMITTER_ID"] == str(emitter_id)]
+            if not match.empty and "ISSUER" in match.columns:
+                emitter_name = match.iloc[0]["ISSUER"]
+
+        # Если эмитент Минфин России, нужно передать имя в fetch_emitter_id для TQOB
+        if not emitter_id and emitter_name and "МИНФИН РОССИИ" in emitter_name.upper():
+            emitter_id = fetch_emitter_id(isin, issuer_name=emitter_name)
+
+        # --- Информация о бумаге ---
         secname = maturity_date = put_date = call_date = None
         success = False
 
@@ -146,7 +158,6 @@ def get_bond_data(isin):
                 cols_info = data_info.get("securities", {}).get("columns", [])
                 if rows_info:
                     info = dict(zip(cols_info, rows_info[0]))
-                    emitter_id = info.get("EMITTER_ID") or info.get("emitter_id")
                     secname = info.get("SECNAME")
                     maturity_date = info.get("MATDATE")
                     put_date = info.get("PUTOPTIONDATE")
@@ -156,7 +167,7 @@ def get_bond_data(isin):
             pass
 
         # --- Если стандартный запрос не сработал, пробуем TQOB (для ОФЗ) ---
-        if not success:
+        if not success and emitter_name and "МИНФИН РОССИИ" in emitter_name.upper():
             try:
                 url_tqob_sec = "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQOB/securities.xml?iss.meta=off"
                 r = session.get(url_tqob_sec, timeout=10)
@@ -164,7 +175,6 @@ def get_bond_data(isin):
                 root = ET.fromstring(r.content)
                 for row in root.iter("row"):
                     if row.attrib.get("isin") == isin:
-                        emitter_id = row.attrib.get("emitterid") or row.attrib.get("EMITTERID")
                         secname = row.attrib.get("SECNAME") or row.attrib.get("secname")
                         maturity_date = row.attrib.get("MATDATE")
                         put_date = row.attrib.get("PUTOPTIONDATE")
@@ -199,13 +209,6 @@ def get_bond_data(isin):
                     coupon_date = next_date("coupondate")
             except Exception:
                 record_date = coupon_date = None
-
-        # --- Подставляем Наименование эмитента через справочник ---
-        emitter_name = None
-        if emitter_id and not df_emitters.empty:
-            match = df_emitters[df_emitters["EMITTER_ID"] == str(emitter_id)]
-            if not match.empty and "ISSUER" in match.columns:
-                emitter_name = match.iloc[0]["ISSUER"]
 
         # --- Форматирование дат ---
         def fmt(date):
