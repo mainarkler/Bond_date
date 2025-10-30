@@ -23,7 +23,6 @@ if "last_file_name" not in st.session_state:
 
 # === Настройки длительности РЕПО ===
 st.subheader("⚙️ Настройки длительности РЕПО")
-
 if "overnight" not in st.session_state:
     st.session_state["overnight"] = False
 if "extra_days" not in st.session_state:
@@ -38,7 +37,6 @@ if st.button("🔄 Очистить форму"):
     st.rerun()
 
 overnight = st.checkbox("Overnight РЕПО", key="overnight")
-
 extra_days_input = st.number_input(
     "Дней РЕПО:",
     min_value=2,
@@ -47,10 +45,8 @@ extra_days_input = st.number_input(
     disabled=st.session_state["overnight"],
     key="extra_days",
 )
-
 if st.session_state["overnight"]:
     st.markdown("<span style='color:gray'>Дополнительные дни отключены при включенном Overnight</span>", unsafe_allow_html=True)
-
 days_threshold = 3 if st.session_state["overnight"] else 1 + st.session_state["extra_days"]
 st.write(f"Текущее значение границы выплат: {days_threshold} дн.")
 
@@ -59,22 +55,18 @@ def safe_read_csv(path):
     if not os.path.exists(path):
         st.warning(f"⚠️ Файл не найден: {path}")
         return pd.DataFrame()
-
     try:
         with open(path, "r", encoding="utf-8-sig") as f:
             content = f.read().replace('"', '').replace("'", "").strip()
-
         sample = content[:2048]
         try:
             dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t"])
             sep = dialect.delimiter
         except Exception:
             sep = ","
-
         df = pd.read_csv(StringIO(content), sep=sep, dtype=str)
         df.columns = [c.strip().upper() for c in df.columns]
         return df
-
     except Exception as e:
         st.warning(f"⚠️ Ошибка при чтении файла {os.path.basename(path)}: {e}")
         return pd.DataFrame()
@@ -101,98 +93,14 @@ else:
 session = requests.Session()
 session.headers.update({"User-Agent": "python-requests/iss-moex-emitter-id-script"})
 
-# === Загрузка списка ОФЗ с доски TQOB (кэшируется) ===
-@st.cache_data(show_spinner=False)
-def load_tqob_securities():
-    """
-    Загружает securities.xml только с доски TQOB (ОФЗ).
-    Возвращает DataFrame с колонками SECID и ISIN.
-    """
-    board = "TQOB"
-    combined = []
-    try:
-        url = f"https://iss.moex.com/iss/engines/stock/markets/bonds/boards/{board}/securities.xml?iss.meta=off"
-        r = session.get(url, timeout=20)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-        for row in root.findall(".//row"):
-            secid = row.attrib.get("secid")
-            isin = row.attrib.get("isin")
-            if secid and isin:
-                combined.append({"SECID": secid, "ISIN": isin})
-    except Exception as e:
-        # не прерываем исполнение, просто вернём пустой DF и предупредим
-        st.warning(f"⚠️ Не удалось загрузить TQOB: {e}")
-    df_tqob = pd.DataFrame(combined).drop_duplicates(subset=["ISIN"])
-    return df_tqob
-
-df_tqob = load_tqob_securities()
-
-# === Поиск SECID: сначала общий поиск через /iss/securities.json (как раньше), затем резерв — TQOB ===
-def fetch_secid_general(isin: str):
-    """
-    Предыдущая общая логика: попытка найти SECID через /iss/securities.json?q=ISIN
-    Возвращает SECID или None
-    """
-    isin = isin.strip().upper()
-    try:
-        url = f"https://iss.moex.com/iss/securities.json?q={isin}&iss.meta=off"
-        r = session.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        securities = data.get("securities", {})
-        columns = securities.get("columns", [])
-        data_rows = securities.get("data", [])
-        if not data_rows:
-            return None
-        df = pd.DataFrame(data_rows, columns=columns)
-        # некоторые ответы могут быть без ISIN/SECID, поэтому проверяем
-        if "ISIN" in df.columns and "SECID" in df.columns:
-            match = df[df["ISIN"].str.upper() == isin]
-            if not match.empty:
-                return match.iloc[0]["SECID"]
-        # если точного совпадения по ISIN нет, попробуем вернуть первый SECID из списка
-        if "SECID" in df.columns and not df.empty:
-            return df.iloc[0]["SECID"]
-    except Exception:
-        pass
-    return None
-
-def fetch_secid_from_tqob(isin: str):
-    """
-    Ищет SECID в заранее загруженном списке TQOB (для ОФЗ).
-    """
-    isin = isin.strip().upper()
-    if df_tqob.empty:
+def fetch_emitter_id(isin: str):
+    """Попытка получить EMITTER_ID по ISIN через стандартный API и TQOB (для ОФЗ)"""
+    isin = str(isin).strip()
+    if not isin:
         return None
-    match = df_tqob[df_tqob["ISIN"].str.upper() == isin]
-    if not match.empty:
-        return match.iloc[0]["SECID"]
-    return None
-
-def fetch_secid_by_isin(isin: str):
-    """
-    Комбинированный поиск SECID:
-    1) Общий поиск (как раньше) — для корпоративных и большинства случаев.
-    2) Если не найден — попытка найти в TQOB (ОФЗ).
-    """
-    # 1) общий поиск
-    secid = fetch_secid_general(isin)
-    if secid:
-        return secid, "general"
-    # 2) поиск в TQOB
-    secid_tqob = fetch_secid_from_tqob(isin)
-    if secid_tqob:
-        return secid_tqob, "tqob"
-    return None, None
-
-# --- Получение emitter_id (как раньше) ---
-def fetch_emitter_id(secid: str):
-    secid = str(secid).strip()
-    if not secid:
-        return None
+    # --- Стандартный запрос ---
     try:
-        url = f"https://iss.moex.com/iss/securities/{secid}.json"
+        url = f"https://iss.moex.com/iss/securities/{isin}.json"
         r = session.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
@@ -205,8 +113,10 @@ def fetch_emitter_id(secid: str):
                     return rows[0][i]
     except Exception:
         pass
+
+    # --- Попытка через XML ---
     try:
-        url = f"https://iss.moex.com/iss/securities/{secid}.xml?iss.meta=off"
+        url = f"https://iss.moex.com/iss/securities/{isin}.xml?iss.meta=off"
         r = session.get(url, timeout=10)
         r.raise_for_status()
         root = ET.fromstring(r.content)
@@ -216,17 +126,25 @@ def fetch_emitter_id(secid: str):
                 return row.attrib.get("value") or row.attrib.get("VALUE")
     except Exception:
         pass
+
+    # --- Дополнительный поиск SECID для ОФЗ через TQOB ---
+    try:
+        url_tqob = "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQOB/securities.xml?iss.meta=off"
+        r = session.get(url_tqob, timeout=10)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        for row in root.iter("row"):
+            if row.attrib.get("isin") == isin:
+                return row.attrib.get("emitterid") or row.attrib.get("EMITTERID")
+    except Exception:
+        pass
+
     return None
 
 # === Получение данных по ISIN ===
 def get_bond_data(isin):
     try:
-        secid, source = fetch_secid_by_isin(isin)
-        if not secid:
-            st.warning(f"⚠️ Не найден SECID для {isin}")
-            return None
-
-        emitter_id = fetch_emitter_id(secid)
+        emitter_id = fetch_emitter_id(isin)
         emitter_name = None
 
         if emitter_id and not df_emitters.empty:
@@ -264,29 +182,49 @@ def get_bond_data(isin):
 
         # --- Информация о бумаге ---
         secname = maturity_date = put_date = call_date = None
+        success = False
 
-        # Если бумага найдена общим способом (корп./прочие) — используем прежнюю логику получения info
-        if source == "general":
-            url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
+        # --- Стандартный запрос ---
+        try:
+            url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{isin}.json"
+            response_info = requests.get(url_info, timeout=10)
+            if response_info.status_code == 200:
+                data_info = response_info.json()
+                rows_info = data_info.get("securities", {}).get("data", [])
+                cols_info = data_info.get("securities", {}).get("columns", [])
+                if rows_info:
+                    info = dict(zip(cols_info, rows_info[0]))
+                    secname = info.get("SECNAME")
+                    maturity_date = info.get("MATDATE")
+                    put_date = info.get("PUTOPTIONDATE")
+                    call_date = info.get("CALLOPTIONDATE")
+                    success = True
+        except Exception:
+            pass
+
+        # --- Если стандартный запрос не сработал (ОФЗ), пробуем через TQOB ---
+        if not success:
             try:
-                response_info = requests.get(url_info, timeout=10)
-                if response_info.status_code == 200:
-                    data_info = response_info.json()
-                    rows_info = data_info.get("securities", {}).get("data", [])
-                    cols_info = data_info.get("securities", {}).get("columns", [])
-                    if rows_info:
-                        info = dict(zip(cols_info, rows_info[0]))
-                        secname = info.get("SECNAME")
-                        maturity_date = info.get("MATDATE")
-                        put_date = info.get("PUTOPTIONDATE")
-                        call_date = info.get("CALLOPTIONDATE")
+                url_tqob_sec = "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQOB/securities.xml?iss.meta=off"
+                r = session.get(url_tqob_sec, timeout=10)
+                r.raise_for_status()
+                root = ET.fromstring(r.content)
+                for row in root.iter("row"):
+                    if row.attrib.get("isin") == isin:
+                        secname = row.attrib.get("SECNAME") or row.attrib.get("secname")
+                        maturity_date = row.attrib.get("MATDATE")
+                        put_date = row.attrib.get("PUTOPTIONDATE")
+                        call_date = row.attrib.get("CALLOPTIONDATE")
+                        success = True
+                        break
             except Exception:
                 pass
 
-            # --- Купоны (корпоративные / общий путь) ---
-            record_date = coupon_date = None
+        # --- Купоны ---
+        record_date = coupon_date = None
+        if success:
             try:
-                url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json?iss.only=coupons&iss.meta=off"
+                url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{isin}.json?iss.only=coupons&iss.meta=off"
                 response_coupons = requests.get(url_coupons, timeout=10)
                 response_coupons.raise_for_status()
                 data_coupons = response_coupons.json()
@@ -305,61 +243,8 @@ def get_bond_data(isin):
 
                     record_date = next_date("recorddate")
                     coupon_date = next_date("coupondate")
-                else:
-                    record_date = coupon_date = None
             except Exception:
                 record_date = coupon_date = None
-
-        # Если бумага найдена в TQOB (ОФЗ) — специально получаем info и coupons (дублируем блоки для надежности)
-        elif source == "tqob":
-            # info для TQOB (тот же endpoint, но отдельный блок — чтобы было явно)
-            try:
-                url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
-                response_info = requests.get(url_info, timeout=10)
-                if response_info.status_code == 200:
-                    data_info = response_info.json()
-                    rows_info = data_info.get("securities", {}).get("data", [])
-                    cols_info = data_info.get("securities", {}).get("columns", [])
-                    if rows_info:
-                        info = dict(zip(cols_info, rows_info[0]))
-                        secname = info.get("SECNAME")
-                        maturity_date = info.get("MATDATE")
-                        put_date = info.get("PUTOPTIONDATE")
-                        call_date = info.get("CALLOPTIONDATE")
-            except Exception:
-                pass
-
-            # купоны для TQOB (отдельный блок — тоже тот же endpoint, но выполняется независимо)
-            record_date = coupon_date = None
-            try:
-                url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json?iss.only=coupons&iss.meta=off"
-                response_coupons = requests.get(url_coupons, timeout=10)
-                response_coupons.raise_for_status()
-                data_coupons = response_coupons.json()
-                coupons = data_coupons.get("coupons", {}).get("data", [])
-                columns_coupons = data_coupons.get("coupons", {}).get("columns", [])
-                if coupons:
-                    df_coupons = pd.DataFrame(coupons, columns=columns_coupons)
-                    today = pd.to_datetime(datetime.today().date())
-
-                    def next_date(col):
-                        if col in df_coupons:
-                            future = pd.to_datetime(df_coupons[col], errors="coerce")
-                            future = future[future >= today]
-                            return future.min() if not future.empty else None
-                        return None
-
-                    record_date = next_date("recorddate")
-                    coupon_date = next_date("coupondate")
-                else:
-                    record_date = coupon_date = None
-            except Exception:
-                record_date = coupon_date = None
-
-        else:
-            # на всякий случай — если source не определён (хотя до сюда не должно доходить)
-            secname = maturity_date = put_date = call_date = None
-            record_date = coupon_date = None
 
         # --- Форматирование ---
         def fmt(date):
@@ -372,8 +257,6 @@ def get_bond_data(isin):
 
         return {
             "ISIN": isin,
-            "SECID": secid,
-            "Источник SECID": source,
             "Код эмитента": emitter_id,
             "Наименование эмитента": emitter_name,
             "Рейтинг": rating,
