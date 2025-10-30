@@ -93,12 +93,19 @@ else:
 session = requests.Session()
 session.headers.update({"User-Agent": "python-requests/iss-moex-emitter-id-script"})
 
-def fetch_emitter_id(isin: str):
-    """Попытка получить EMITTER_ID по ISIN через стандартный API и TQOB (для ОФЗ)"""
+# === Функция поиска SECID ===
+def fetch_emitter_id(isin: str, issuer_name: str = None):
+    """
+    Получаем EMITTER_ID для ISIN.
+    Для корпоративных облигаций используем стандартный API.
+    Для ОФЗ (Минфин России) если стандартный API не вернул данные,
+    ищем SECID через TQOB.
+    """
     isin = str(isin).strip()
     if not isin:
         return None
-    # --- Стандартный запрос ---
+
+    # --- Стандартный запрос JSON ---
     try:
         url = f"https://iss.moex.com/iss/securities/{isin}.json"
         r = session.get(url, timeout=10)
@@ -114,7 +121,7 @@ def fetch_emitter_id(isin: str):
     except Exception:
         pass
 
-    # --- Попытка через XML ---
+    # --- Стандартный запрос XML ---
     try:
         url = f"https://iss.moex.com/iss/securities/{isin}.xml?iss.meta=off"
         r = session.get(url, timeout=10)
@@ -127,30 +134,35 @@ def fetch_emitter_id(isin: str):
     except Exception:
         pass
 
-    # --- Дополнительный поиск SECID для ОФЗ через TQOB ---
-    try:
-        url_tqob = "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQOB/securities.xml?iss.meta=off"
-        r = session.get(url_tqob, timeout=10)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-        for row in root.iter("row"):
-            if row.attrib.get("isin") == isin:
-                return row.attrib.get("emitterid") or row.attrib.get("EMITTERID")
-    except Exception:
-        pass
+    # --- Если эмитент Минфин России, ищем через TQOB ---
+    if issuer_name and "МИНФИН РОССИИ" in issuer_name.upper():
+        try:
+            url_tqob = "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQOB/securities.xml?iss.meta=off"
+            r = session.get(url_tqob, timeout=10)
+            r.raise_for_status()
+            root = ET.fromstring(r.content)
+            for row in root.iter("row"):
+                if row.attrib.get("isin") == isin:
+                    return row.attrib.get("emitterid") or row.attrib.get("EMITTERID")
+        except Exception:
+            pass
 
     return None
 
 # === Получение данных по ISIN ===
 def get_bond_data(isin):
     try:
+        # --- Попытка найти эмитента через справочник ---
         emitter_id = fetch_emitter_id(isin)
         emitter_name = None
-
         if emitter_id and not df_emitters.empty:
             match = df_emitters[df_emitters["EMITTER_ID"] == str(emitter_id)]
             if not match.empty and "ISSUER" in match.columns:
                 emitter_name = match.iloc[0]["ISSUER"]
+
+        # Если эмитент Минфин России, нужно передать имя в fetch_emitter_id для TQOB
+        if not emitter_id and emitter_name and "МИНФИН РОССИИ" in emitter_name.upper():
+            emitter_id = fetch_emitter_id(isin, issuer_name=emitter_name)
 
         # --- Рейтинг ---
         rating = None
@@ -184,7 +196,7 @@ def get_bond_data(isin):
         secname = maturity_date = put_date = call_date = None
         success = False
 
-        # --- Стандартный запрос ---
+        # --- Стандартный запрос JSON ---
         try:
             url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{isin}.json"
             response_info = requests.get(url_info, timeout=10)
@@ -202,8 +214,8 @@ def get_bond_data(isin):
         except Exception:
             pass
 
-        # --- Если стандартный запрос не сработал (ОФЗ), пробуем через TQOB ---
-        if not success:
+        # --- Если стандартный запрос не сработал, пробуем TQOB (для ОФЗ) ---
+        if not success and emitter_name and "МИНФИН РОССИИ" in emitter_name.upper():
             try:
                 url_tqob_sec = "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQOB/securities.xml?iss.meta=off"
                 r = session.get(url_tqob_sec, timeout=10)
@@ -246,7 +258,7 @@ def get_bond_data(isin):
             except Exception:
                 record_date = coupon_date = None
 
-        # --- Форматирование ---
+        # --- Форматирование дат ---
         def fmt(date):
             if pd.isna(date) or not date:
                 return None
