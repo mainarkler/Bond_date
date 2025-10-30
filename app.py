@@ -10,7 +10,7 @@ import csv
 import re
 
 # === Настройки страницы ===
-st.set_page_config(page_title="РЕПО претрейд risc's", page_icon="📈", layout="wide")
+st.set_page_config(page_title="РЕПО претрейд", page_icon="📈", layout="wide")
 st.title("📈 РЕПО претрейд")
 
 # === Session state ===
@@ -73,21 +73,7 @@ def safe_read_csv(path):
 
 # === Загрузка справочников ===
 EMITTER_FILE = "https://raw.githubusercontent.com/mainarkler/Bond_date/main/Pifagr_name_with_emitter.csv"
-RATING_FILE = r"C:\Desktop\code\App\scor.csv"
-
 df_emitters = pd.read_csv(EMITTER_FILE)
-df_rating = safe_read_csv(RATING_FILE)
-
-if not df_rating.empty:
-    rating_col = next((c for c in df_rating.columns if "RATING" in c.upper()), None)
-    issuer_col = next((c for c in df_rating.columns if "ISSUER" in c.upper()), None)
-    if rating_col and issuer_col:
-        df_rating = df_rating.rename(columns={rating_col: "RATING", issuer_col: "ISSUER"})
-        df_rating["RATING"] = pd.to_numeric(df_rating["RATING"], errors="coerce")
-    else:
-        df_rating = pd.DataFrame(columns=["ISSUER", "RATING"])
-else:
-    df_rating = pd.DataFrame(columns=["ISSUER", "RATING"])
 
 # === MOEX API ===
 session = requests.Session()
@@ -95,12 +81,6 @@ session.headers.update({"User-Agent": "python-requests/iss-moex-emitter-id-scrip
 
 # === Функция поиска SECID ===
 def fetch_emitter_id(isin: str, issuer_name: str = None):
-    """
-    Получаем EMITTER_ID для ISIN.
-    Для корпоративных облигаций используем стандартный API.
-    Для ОФЗ (Минфин России) если стандартный API не вернул данные,
-    ищем SECID через TQOB.
-    """
     isin = str(isin).strip()
     if not isin:
         return None
@@ -163,34 +143,6 @@ def get_bond_data(isin):
         # Если эмитент Минфин России, нужно передать имя в fetch_emitter_id для TQOB
         if not emitter_id and emitter_name and "МИНФИН РОССИИ" in emitter_name.upper():
             emitter_id = fetch_emitter_id(isin, issuer_name=emitter_name)
-
-        # --- Рейтинг ---
-        rating = None
-        if emitter_name and not df_rating.empty:
-            match_r = df_rating[
-                df_rating["ISSUER"].str.strip().str.lower() == emitter_name.strip().lower()
-            ]
-            if not match_r.empty:
-                rating = match_r.iloc[0]["RATING"]
-
-        # --- Лимит ---
-        def calc_limit(emitter_name, rating):
-            if not emitter_name:
-                return "0%"
-            if "МИНФИН РОССИИ" in emitter_name.upper():
-                return "100%"
-            try:
-                r = float(rating)
-                if r <= 12:
-                    return "25%"
-                elif 13 <= r < 18:
-                    return "15%"
-                else:
-                    return "0%"
-            except Exception:
-                return "0%"
-
-        limit = calc_limit(emitter_name, rating)
 
         # --- Информация о бумаге ---
         secname = maturity_date = put_date = call_date = None
@@ -271,8 +223,6 @@ def get_bond_data(isin):
             "ISIN": isin,
             "Код эмитента": emitter_id,
             "Наименование эмитента": emitter_name,
-            "Рейтинг": rating,
-            "Лимит": limit,
             "Наименование инструмента": secname,
             "Дата погашения": fmt(maturity_date),
             "Дата оферты Put": fmt(put_date),
@@ -372,7 +322,7 @@ if st.session_state["results"] is not None:
     st.download_button(
         label="💾 Скачать результат (Excel)",
         data=to_excel(df_res),
-        file_name="bond_data_with_limits.xlsx",
+        file_name="bond_data.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 else:
