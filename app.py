@@ -26,16 +26,6 @@ if "overnight" not in st.session_state:
 if "extra_days" not in st.session_state:
     st.session_state["extra_days"] = 2
 
-if st.button("🔄 Очистить форму"):
-    st.session_state.update({
-        "overnight": False,
-        "extra_days": 2,
-        "results": None,
-        "file_loaded": False,
-        "last_file_name": None
-    })
-    st.rerun()
-
 overnight = st.checkbox("Overnight РЕПО", key="overnight")
 extra_days_input = st.number_input(
     "Дней РЕПО:", min_value=2, max_value=366, step=1,
@@ -60,11 +50,8 @@ def fetch_emitter_and_secid(isin: str):
     isin = str(isin).strip()
     if not isin:
         return None, None
-
     emitter_id = None
     secid = None
-
-    # JSON запрос
     try:
         url = f"https://iss.moex.com/iss/securities/{isin}.json"
         r = httpx.get(url, timeout=10)
@@ -81,8 +68,6 @@ def fetch_emitter_and_secid(isin: str):
                     secid = rows[0][i]
     except:
         pass
-
-    # XML запрос
     if not emitter_id or not secid:
         try:
             url = f"https://iss.moex.com/iss/securities/{isin}.xml?iss.meta=off"
@@ -98,8 +83,6 @@ def fetch_emitter_and_secid(isin: str):
                         secid = row.attrib.get("value") or row.attrib.get("VALUE")
         except:
             pass
-
-    # TQOB для ОФЗ
     if not secid or not emitter_id:
         for row in tqob_root.iter("row"):
             if row.attrib.get("isin") == isin:
@@ -107,59 +90,60 @@ def fetch_emitter_and_secid(isin: str):
                     secid = row.attrib.get("secid") or row.attrib.get("SECID")
                 if not emitter_id:
                     emitter_id = row.attrib.get("emitterid") or row.attrib.get("EMITTERID")
-
     return emitter_id, secid
 
 # === Асинхронная обработка ISIN ===
-async def get_bond_data_async(isin):
+async def get_bond_data_async(isin, progress=None, idx=None, total=None):
     emitter_id, secid = fetch_emitter_and_secid(isin)
-    if not secid:
-        return {"ISIN": isin}
-
     result = {"ISIN": isin, "Код эмитента": emitter_id}
-    try:
-        # Информация о бумаге
-        url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
-        r = httpx.get(url_info, timeout=10)
-        if r.status_code == 200:
-            data_info = r.json()
-            rows_info = data_info.get("securities", {}).get("data", [])
-            cols_info = data_info.get("securities", {}).get("columns", [])
-            if rows_info:
-                info = dict(zip(cols_info, rows_info[0]))
-                result.update({
-                    "Наименование инструмента": info.get("SECNAME"),
-                    "Дата погашения": info.get("MATDATE"),
-                    "Дата оферты Put": info.get("PUTOPTIONDATE"),
-                    "Дата оферты Call": info.get("CALLOPTIONDATE")
-                })
-        # Купоны
-        url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json?iss.only=coupons&iss.meta=off"
-        r = httpx.get(url_coupons, timeout=10)
-        r.raise_for_status()
-        data_coupons = r.json().get("coupons", {})
-        df_coupons = pd.DataFrame(data_coupons.get("data", []), columns=data_coupons.get("columns", []))
-        today = pd.to_datetime(datetime.today().date())
-        for col in ["recorddate", "coupondate"]:
-            if col in df_coupons:
-                future = pd.to_datetime(df_coupons[col], errors="coerce")
-                future = future[future >= today]
-                result[f"Дата фиксации купона" if col=="recorddate" else f"Дата купона"] = future.min() if not future.empty else None
-    except:
-        pass
-
-    # Форматирование дат
+    if secid:
+        try:
+            url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
+            r = httpx.get(url_info, timeout=10)
+            if r.status_code == 200:
+                data_info = r.json()
+                rows_info = data_info.get("securities", {}).get("data", [])
+                cols_info = data_info.get("securities", {}).get("columns", [])
+                if rows_info:
+                    info = dict(zip(cols_info, rows_info[0]))
+                    result.update({
+                        "Наименование инструмента": info.get("SECNAME"),
+                        "Дата погашения": info.get("MATDATE"),
+                        "Дата оферты Put": info.get("PUTOPTIONDATE"),
+                        "Дата оферты Call": info.get("CALLOPTIONDATE")
+                    })
+            url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json?iss.only=coupons&iss.meta=off"
+            r = httpx.get(url_coupons, timeout=10)
+            r.raise_for_status()
+            data_coupons = r.json().get("coupons", {})
+            df_coupons = pd.DataFrame(data_coupons.get("data", []), columns=data_coupons.get("columns", []))
+            today = pd.to_datetime(datetime.today().date())
+            for col in ["recorddate", "coupondate"]:
+                if col in df_coupons:
+                    future = pd.to_datetime(df_coupons[col], errors="coerce")
+                    future = future[future >= today]
+                    result[f"Дата фиксации купона" if col=="recorddate" else f"Дата купона"] = future.min() if not future.empty else None
+        except:
+            pass
     for key in ["Дата погашения", "Дата оферты Put", "Дата оферты Call", "Дата фиксации купона", "Дата купона"]:
         if key in result and result[key]:
             try:
                 result[key] = pd.to_datetime(result[key]).strftime("%Y-%m-%d")
             except:
                 result[key] = None
+    if progress is not None and idx is not None and total is not None:
+        progress.progress((idx + 1) / total)
     return result
 
 async def fetch_isins_async(isins):
-    tasks = [get_bond_data_async(isin) for isin in isins]
-    return await asyncio.gather(*tasks)
+    results = []
+    progress_bar = st.progress(0)
+    total = len(isins)
+    for idx, isin in enumerate(isins):
+        data = await get_bond_data_async(isin, progress_bar, idx, total)
+        results.append(data)
+    progress_bar.empty()
+    return results
 
 def fetch_isins_parallel(isins):
     return asyncio.run(fetch_isins_async(isins))
@@ -183,22 +167,20 @@ with tab1:
                 df = pd.read_excel(uploaded_file, usecols=["ISIN"], dtype=str)
             isins = df["ISIN"].dropna().unique().tolist()
             st.write(f"Найдено {len(isins)} ISIN")
-            if st.button("🔍 Получить данные по ISIN из файла"):
-                with st.spinner("Обработка..."):
-                    results = fetch_isins_parallel(isins)
-                    st.session_state["results"] = pd.DataFrame(results)
-                    st.success("✅ Данные успешно получены!")
-
-with tab2:
-    isin_input = st.text_area("Введите ISIN (через пробел или запятую)", height=150)
-    if st.button("🔍 Получить данные по введённым ISIN"):
-        raw_text = isin_input.strip()
-        if raw_text:
-            isins = [i.strip().upper() for i in re.split(r"[\s,;]+", raw_text) if i.strip()]
-            with st.spinner("Обработка..."):
+            # Автоматическая обработка
+            with st.spinner("Обработка файла..."):
                 results = fetch_isins_parallel(isins)
                 st.session_state["results"] = pd.DataFrame(results)
                 st.success("✅ Данные успешно получены!")
+
+with tab2:
+    isin_input = st.text_area("Введите ISIN (через пробел или запятую)", height=150)
+    if isin_input.strip():
+        isins = [i.strip().upper() for i in re.split(r"[\s,;]+", isin_input) if i.strip()]
+        with st.spinner("Обработка введённых ISIN..."):
+            results = fetch_isins_parallel(isins)
+            st.session_state["results"] = pd.DataFrame(results)
+            st.success("✅ Данные успешно получены!")
 
 # === Подгрузка справочника эмитентов ===
 @st.cache_data(ttl=86400)
