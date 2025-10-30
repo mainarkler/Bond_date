@@ -234,4 +234,63 @@ with tab2:
 # === Обработка файла ===
 if uploaded_file:
     if not st.session_state["file_loaded"] or uploaded_file.name != st.session_state["last_file_name"]:
-        st.session_state["file_loaded
+        st.session_state["file_loaded"] = True
+        st.session_state["last_file_name"] = uploaded_file.name
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file, dtype=str)
+        else:
+            df = pd.read_excel(uploaded_file, dtype=str)
+        if "ISIN" not in df.columns:
+            st.error("❌ В файле должна быть колонка 'ISIN'.")
+            st.stop()
+        isins = df["ISIN"].dropna().unique().tolist()
+        results = []
+        progress_bar = st.progress(0)
+        for idx, isin in enumerate(isins, start=1):
+            data = get_bond_data(isin)
+            if data:
+                results.append(data)
+            progress_bar.progress(idx / len(isins))
+            time.sleep(0.1)
+        st.session_state["results"] = pd.DataFrame(results)
+        st.success("✅ Данные успешно получены из файла!")
+
+# === Стилизация ===
+def style_df(row):
+    if (pd.isna(row["Наименование инструмента"]) or row["Наименование инструмента"] in [None, "None", ""]):
+        return ["background-color: DimGray; color: white"] * len(row)
+    today = datetime.today().date()
+    danger_threshold = today + timedelta(days=days_threshold)
+    key_dates = ["Дата погашения", "Дата оферты Put", "Дата оферты Call", "Дата фиксации купона", "Дата купона"]
+    colors = ["" for _ in row]
+    for i, col in enumerate(row.index):
+        if col in key_dates and pd.notnull(row[col]):
+            try:
+                d = pd.to_datetime(row[col]).date()
+                if d <= danger_threshold:
+                    colors[i] = "background-color: Chocolate"
+            except:
+                pass
+    if any(c == "background-color: Chocolate" for c in colors):
+        colors = ["background-color: SandyBrown" if c == "" else c for c in colors]
+    return colors
+
+# === Вывод результатов ===
+if st.session_state["results"] is not None:
+    df_res = st.session_state["results"]
+    st.dataframe(df_res.style.apply(style_df, axis=1), use_container_width=True)
+
+    def to_excel(df):
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Данные")
+        return output.getvalue()
+
+    st.download_button(
+        label="💾 Скачать результат (Excel)",
+        data=to_excel(df_res),
+        file_name="bond_data.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+else:
+    st.info("👆 Загрузите файл или введите ISIN-ы вручную.")
