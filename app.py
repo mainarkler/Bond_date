@@ -47,7 +47,7 @@ extra_days_input = st.number_input(
 )
 if st.session_state["overnight"]:
     st.markdown("<span style='color:gray'>Дополнительные дни отключены при включенном Overnight</span>", unsafe_allow_html=True)
-days_threshold = 3 if st.session_state["overnight"] else 1 + st.session_state["extra_days"]
+days_threshold = 2 if st.session_state["overnight"] else 1 + st.session_state["extra_days"]
 st.write(f"Текущее значение границы выплат: {days_threshold} дн.")
 
 # === Безопасное чтение CSV ===
