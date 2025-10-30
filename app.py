@@ -101,31 +101,37 @@ else:
 session = requests.Session()
 session.headers.update({"User-Agent": "python-requests/iss-moex-emitter-id-script"})
 
-# --- Новый блок: Получение SECID по ISIN ---
+# === Загрузка всех облигаций с MOEX для поиска SECID ===
+@st.cache_data(show_spinner=False)
+def load_all_bonds_from_boards():
+    boards = ["TQOB", "TQSB", "TQOBP"]
+    combined = []
+    for board in boards:
+        try:
+            url = f"https://iss.moex.com/iss/engines/stock/markets/bonds/boards/{board}/securities.xml?iss.meta=off"
+            r = session.get(url, timeout=15)
+            r.raise_for_status()
+            root = ET.fromstring(r.content)
+            for row in root.findall(".//row"):
+                secid = row.attrib.get("secid")
+                isin = row.attrib.get("isin")
+                if secid and isin:
+                    combined.append({"SECID": secid, "ISIN": isin})
+        except Exception as e:
+            st.warning(f"⚠️ Ошибка загрузки с доски {board}: {e}")
+    df_all = pd.DataFrame(combined).drop_duplicates(subset=["ISIN"])
+    return df_all
+
+df_all_bonds = load_all_bonds_from_boards()
+
 def fetch_secid_by_isin(isin: str):
-    """
-    Получает SECID по ISIN через MOEX ISS API.
-    Возвращает строку SECID или None, если не найдено.
-    """
     isin = isin.strip().upper()
-    try:
-        url = f"https://iss.moex.com/iss/securities.json?q={isin}&iss.meta=off"
-        r = session.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        securities = data.get("securities", {})
-        columns = securities.get("columns", [])
-        data_rows = securities.get("data", [])
-        if not data_rows:
-            return None
-        df = pd.DataFrame(data_rows, columns=columns)
-        if "ISIN" in df.columns and "SECID" in df.columns:
-            match = df[df["ISIN"].str.upper() == isin]
-            if not match.empty:
-                return match.iloc[0]["SECID"]
+    if df_all_bonds.empty:
         return None
-    except Exception:
-        return None
+    match = df_all_bonds[df_all_bonds["ISIN"].str.upper() == isin]
+    if not match.empty:
+        return match.iloc[0]["SECID"]
+    return None
 
 # --- Получение emitter_id ---
 def fetch_emitter_id(secid: str):
