@@ -305,12 +305,22 @@ def style_df(row):
 if st.session_state["results"] is not None:
     df_res = st.session_state["results"]
 
-    # === Добавление столбца 'Эмитент' ===
-    if not df_emitters.empty:
-        df_res = df_res.merge(df_emitters, how="left", left_on="Код эмитента", right_on="EMITTER_ID")
-        df_res["Эмитент"] = df_res["Issuer"]
-        df_res.drop(columns=["Issuer", "EMITTER_ID"], inplace=True, errors="ignore")
-        st.session_state["results"] = df_res
+# === Добавление столбца 'Эмитент' ===
+if not df_emitters.empty:
+    df_res = df_res.merge(df_emitters, how="left", left_on="Код эмитента", right_on="EMITTER_ID")
+    df_res["Эмитент"] = df_res["Issuer"]
+    df_res.drop(columns=["Issuer", "EMITTER_ID"], inplace=True, errors="ignore")
+    
+    # Переставляем столбцы: 'Эмитент' вторым
+    cols = df_res.columns.tolist()
+    if "Эмитент" in cols and "Код эмитента" in cols:
+        cols.remove("Эмитент")
+        idx = cols.index("Код эмитента")
+        cols.insert(idx + 1, "Эмитент")
+        df_res = df_res[cols]
+
+    st.session_state["results"] = df_res
+
 
     st.dataframe(df_res.style.apply(style_df, axis=1), use_container_width=True)
 
