@@ -75,11 +75,14 @@ def safe_read_csv(path):
 session = requests.Session()
 session.headers.update({"User-Agent": "python-requests/iss-moex-script"})
 
-# === Функция поиска SECID ===
-def fetch_sec_id(isin: str):
+# === Функция поиска эмитента и SECID ===
+def fetch_emitter_and_secid(isin: str):
     isin = str(isin).strip()
     if not isin:
-        return None
+        return None, None
+
+    emitter_id = None
+    secid = None
 
     # --- Стандартный запрос JSON ---
     try:
@@ -92,48 +95,57 @@ def fetch_sec_id(isin: str):
         rows = securities.get("data", [])
         if rows:
             for i, c in enumerate(cols):
+                if c.upper() == "EMITTER_ID":
+                    emitter_id = rows[0][i]
                 if c.upper() == "SECID":
-                    return rows[0][i]
+                    secid = rows[0][i]
     except Exception:
         pass
 
     # --- Стандартный запрос XML ---
-    try:
-        url = f"https://iss.moex.com/iss/securities/{isin}.xml?iss.meta=off"
-        r = session.get(url, timeout=10)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-        for row in root.iter():
-            name_attr = row.attrib.get("name") or row.attrib.get("NAME")
-            if name_attr and name_attr.upper() == "SECID":
-                return row.attrib.get("value") or row.attrib.get("VALUE")
-    except Exception:
-        pass
+    if not emitter_id or not secid:
+        try:
+            url = f"https://iss.moex.com/iss/securities/{isin}.xml?iss.meta=off"
+            r = session.get(url, timeout=10)
+            r.raise_for_status()
+            root = ET.fromstring(r.content)
+            for row in root.iter():
+                name_attr = row.attrib.get("name") or row.attrib.get("NAME")
+                if name_attr:
+                    if name_attr.upper() == "EMITTER_ID" and not emitter_id:
+                        emitter_id = row.attrib.get("value") or row.attrib.get("VALUE")
+                    if name_attr.upper() == "SECID" and not secid:
+                        secid = row.attrib.get("value") or row.attrib.get("VALUE")
+        except Exception:
+            pass
 
-    # --- Если стандартный запрос не дал данных, ищем в TQOB (для ОФЗ) ---
-    try:
-        url_tqob = "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQOB/securities.xml?iss.meta=off"
-        r = session.get(url_tqob, timeout=10)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-        for row in root.iter("row"):
-            if row.attrib.get("isin") == isin:
-                return row.attrib.get("secid") or row.attrib.get("SECID")
-    except Exception:
-        pass
+    # --- Если стандартный запрос не дал secid, ищем в TQOB (для ОФЗ) ---
+    if not secid:
+        try:
+            url_tqob = "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQOB/securities.xml?iss.meta=off"
+            r = session.get(url_tqob, timeout=10)
+            r.raise_for_status()
+            root = ET.fromstring(r.content)
+            for row in root.iter("row"):
+                if row.attrib.get("isin") == isin:
+                    if not secid:
+                        secid = row.attrib.get("secid") or row.attrib.get("SECID")
+                    if not emitter_id:
+                        emitter_id = row.attrib.get("emitterid") or row.attrib.get("EMITTERID")
+        except Exception:
+            pass
 
-    return None
+    return emitter_id, secid
 
 # === Получение данных по ISIN ===
 def get_bond_data(isin):
     try:
-        secid = fetch_sec_id(isin)
+        emitter_id, secid = fetch_emitter_and_secid(isin)
 
-        # --- Информация о бумаге ---
         secname = maturity_date = put_date = call_date = None
         success = False
 
-        # --- Стандартный запрос JSON по secid ---
+        # --- Запрос информации по SECID ---
         if secid:
             try:
                 url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
@@ -189,7 +201,7 @@ def get_bond_data(isin):
 
         return {
             "ISIN": isin,
-            "SECID": secid,
+            "Код эмитента": emitter_id,
             "Наименование инструмента": secname,
             "Дата погашения": fmt(maturity_date),
             "Дата оферты Put": fmt(put_date),
