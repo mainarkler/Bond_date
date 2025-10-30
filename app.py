@@ -81,10 +81,10 @@ def safe_read_csv(path):
         return pd.DataFrame()
 
 # === Загрузка справочников ===
-EMITTER_FILE = https://raw.githubusercontent.com/mainarkler/Bond_date/main/Pifagr_name_with_emitter.csv
+EMITTER_FILE = "https://raw.githubusercontent.com/mainarkler/Bond_date/main/Pifagr_name_with_emitter.csv"
 RATING_FILE = r"C:\Desktop\code\App\scor.csv"
 
-df_emitters = safe_read_csv(EMITTER_FILE)
+df_emitters = pd.read_csv(EMITTER_FILE)
 df_rating = safe_read_csv(RATING_FILE)
 
 if not df_rating.empty:
