@@ -80,7 +80,7 @@ def safe_read_csv(path):
         return pd.DataFrame()
 
 # === Загрузка справочников ===
-EMITTER_FILE = EMITTER_FILE = "https://raw.githubusercontent.com/mainarkler/Bond_date/main/Pifagr_name_with_emitter.csv"
+EMITTER_FILE = "https://raw.githubusercontent.com/mainarkler/Bond_date/main/Pifagr_name_with_emitter.csv"
 RATING_FILE = r"C:\Desktop\code\App\scor.csv"
 
 df_emitters = pd.read_csv(EMITTER_FILE)
@@ -101,12 +101,39 @@ else:
 session = requests.Session()
 session.headers.update({"User-Agent": "python-requests/iss-moex-emitter-id-script"})
 
-def fetch_emitter_id(isin: str):
-    isin = str(isin).strip()
-    if not isin:
+# --- Новый блок: Получение SECID по ISIN ---
+def fetch_secid_by_isin(isin: str):
+    """
+    Получает SECID по ISIN через MOEX ISS API.
+    Возвращает строку SECID или None, если не найдено.
+    """
+    isin = isin.strip().upper()
+    try:
+        url = f"https://iss.moex.com/iss/securities.json?q={isin}&iss.meta=off"
+        r = session.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        securities = data.get("securities", {})
+        columns = securities.get("columns", [])
+        data_rows = securities.get("data", [])
+        if not data_rows:
+            return None
+        df = pd.DataFrame(data_rows, columns=columns)
+        if "ISIN" in df.columns and "SECID" in df.columns:
+            match = df[df["ISIN"].str.upper() == isin]
+            if not match.empty:
+                return match.iloc[0]["SECID"]
+        return None
+    except Exception:
+        return None
+
+# --- Получение emitter_id ---
+def fetch_emitter_id(secid: str):
+    secid = str(secid).strip()
+    if not secid:
         return None
     try:
-        url = f"https://iss.moex.com/iss/securities/{isin}.json"
+        url = f"https://iss.moex.com/iss/securities/{secid}.json"
         r = session.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
@@ -120,7 +147,7 @@ def fetch_emitter_id(isin: str):
     except Exception:
         pass
     try:
-        url = f"https://iss.moex.com/iss/securities/{isin}.xml?iss.meta=off"
+        url = f"https://iss.moex.com/iss/securities/{secid}.xml?iss.meta=off"
         r = session.get(url, timeout=10)
         r.raise_for_status()
         root = ET.fromstring(r.content)
@@ -135,7 +162,12 @@ def fetch_emitter_id(isin: str):
 # === Получение данных по ISIN ===
 def get_bond_data(isin):
     try:
-        emitter_id = fetch_emitter_id(isin)
+        secid = fetch_secid_by_isin(isin)
+        if not secid:
+            st.warning(f"⚠️ Не найден SECID для {isin}")
+            return None
+
+        emitter_id = fetch_emitter_id(secid)
         emitter_name = None
 
         if emitter_id and not df_emitters.empty:
@@ -172,7 +204,7 @@ def get_bond_data(isin):
         limit = calc_limit(emitter_name, rating)
 
         # --- Информация о бумаге ---
-        url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{isin}.json"
+        url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
         response_info = requests.get(url_info, timeout=10)
         secname = maturity_date = put_date = call_date = None
         if response_info.status_code == 200:
@@ -187,7 +219,7 @@ def get_bond_data(isin):
                 call_date = info.get("CALLOPTIONDATE")
 
         # --- Купоны ---
-        url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{isin}.json?iss.only=coupons&iss.meta=off"
+        url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json?iss.only=coupons&iss.meta=off"
         try:
             response_coupons = requests.get(url_coupons, timeout=10)
             response_coupons.raise_for_status()
@@ -225,6 +257,7 @@ def get_bond_data(isin):
 
         return {
             "ISIN": isin,
+            "SECID": secid,
             "Код эмитента": emitter_id,
             "Наименование эмитента": emitter_name,
             "Рейтинг": rating,
