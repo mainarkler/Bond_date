@@ -129,17 +129,18 @@ def fetch_emitter_and_secid(isin: str):
                         secid = row.attrib.get("value") or row.attrib.get("VALUE")
         except Exception:
             pass
-
+    
     # --- TQOB для ОФЗ ---
     if not secid or not emitter_id:
+        isin_clean = isin.strip().upper()
         for row in tqob_root.iter("row"):
-            if row.attrib.get("isin") == isin:
+            xml_isin = (row.attrib.get("isin") or "").strip().upper()
+            if xml_isin == isin_clean:
                 if not secid:
                     secid = row.attrib.get("secid") or row.attrib.get("SECID")
                 if not emitter_id:
                     emitter_id = row.attrib.get("emitterid") or row.attrib.get("EMITTERID")
-
-    return emitter_id, secid
+                break
 
 # === Получение данных по ISIN ===
 def get_bond_data(isin):
