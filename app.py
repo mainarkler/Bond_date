@@ -1,13 +1,13 @@
 import streamlit as st
 import pandas as pd
 import requests
-import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from io import BytesIO, StringIO
 import os
 import csv
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # === Настройки страницы ===
 st.set_page_config(page_title="РЕПО претрейд", page_icon="📈", layout="wide")
@@ -71,11 +71,22 @@ def safe_read_csv(path):
         st.warning(f"⚠️ Ошибка при чтении файла {os.path.basename(path)}: {e}")
         return pd.DataFrame()
 
-# === MOEX API ===
+# === MOEX API session ===
 session = requests.Session()
 session.headers.update({"User-Agent": "python-requests/iss-moex-script"})
 
+# === Кэширование TQOB XML ===
+@st.cache_data(ttl=3600)
+def fetch_tqob_xml():
+    url_tqob = "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQOB/securities.xml?iss.meta=off"
+    r = session.get(url_tqob, timeout=20)
+    r.raise_for_status()
+    return ET.fromstring(r.content)
+
+tqob_root = fetch_tqob_xml()
+
 # === Функция поиска эмитента и SECID ===
+@st.cache_data(ttl=3600)
 def fetch_emitter_and_secid(isin: str):
     isin = str(isin).strip()
     if not isin:
@@ -84,7 +95,7 @@ def fetch_emitter_and_secid(isin: str):
     emitter_id = None
     secid = None
 
-    # --- Стандартный запрос JSON ---
+    # --- Стандартный JSON ---
     try:
         url = f"https://iss.moex.com/iss/securities/{isin}.json"
         r = session.get(url, timeout=10)
@@ -102,7 +113,7 @@ def fetch_emitter_and_secid(isin: str):
     except Exception:
         pass
 
-    # --- Стандартный запрос XML ---
+    # --- Стандартный XML ---
     if not emitter_id or not secid:
         try:
             url = f"https://iss.moex.com/iss/securities/{isin}.xml?iss.meta=off"
@@ -119,21 +130,14 @@ def fetch_emitter_and_secid(isin: str):
         except Exception:
             pass
 
-    # --- Если стандартный запрос не дал secid, ищем в TQOB (для ОФЗ) ---
-    if not secid:
-        try:
-            url_tqob = "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQOB/securities.xml?iss.meta=off"
-            r = session.get(url_tqob, timeout=10)
-            r.raise_for_status()
-            root = ET.fromstring(r.content)
-            for row in root.iter("row"):
-                if row.attrib.get("isin") == isin:
-                    if not secid:
-                        secid = row.attrib.get("secid") or row.attrib.get("SECID")
-                    if not emitter_id:
-                        emitter_id = row.attrib.get("emitterid") or row.attrib.get("EMITTERID")
-        except Exception:
-            pass
+    # --- TQOB для ОФЗ ---
+    if not secid or not emitter_id:
+        for row in tqob_root.iter("row"):
+            if row.attrib.get("isin") == isin:
+                if not secid:
+                    secid = row.attrib.get("secid") or row.attrib.get("SECID")
+                if not emitter_id:
+                    emitter_id = row.attrib.get("emitterid") or row.attrib.get("EMITTERID")
 
     return emitter_id, secid
 
@@ -141,17 +145,16 @@ def fetch_emitter_and_secid(isin: str):
 def get_bond_data(isin):
     try:
         emitter_id, secid = fetch_emitter_and_secid(isin)
-
         secname = maturity_date = put_date = call_date = None
         success = False
 
-        # --- Запрос информации по SECID ---
+        # --- Информация о бумаге по SECID ---
         if secid:
             try:
                 url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
-                response_info = requests.get(url_info, timeout=10)
-                if response_info.status_code == 200:
-                    data_info = response_info.json()
+                r = session.get(url_info, timeout=10)
+                if r.status_code == 200:
+                    data_info = r.json()
                     rows_info = data_info.get("securities", {}).get("data", [])
                     cols_info = data_info.get("securities", {}).get("columns", [])
                     if rows_info:
@@ -169,9 +172,9 @@ def get_bond_data(isin):
         if success and secid:
             try:
                 url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json?iss.only=coupons&iss.meta=off"
-                response_coupons = requests.get(url_coupons, timeout=10)
-                response_coupons.raise_for_status()
-                data_coupons = response_coupons.json()
+                r = session.get(url_coupons, timeout=10)
+                r.raise_for_status()
+                data_coupons = r.json()
                 coupons = data_coupons.get("coupons", {}).get("data", [])
                 columns_coupons = data_coupons.get("coupons", {}).get("columns", [])
                 if coupons:
@@ -190,7 +193,6 @@ def get_bond_data(isin):
             except Exception:
                 record_date = coupon_date = None
 
-        # --- Форматирование дат ---
         def fmt(date):
             if pd.isna(date) or not date:
                 return None
@@ -214,6 +216,17 @@ def get_bond_data(isin):
         st.warning(f"Ошибка при обработке {isin}: {e}")
         return None
 
+# === Параллельная обработка ===
+def fetch_isins_parallel(isins):
+    results = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_isin = {executor.submit(get_bond_data, isin): isin for isin in isins}
+        for future in as_completed(future_to_isin):
+            data = future.result()
+            if data:
+                results.append(data)
+    return results
+
 # === Интерфейс ввода ===
 st.subheader("📤 Загрузка или ввод ISIN")
 tab1, tab2 = st.tabs(["📁 Загрузить файл", "✍️ Ввести вручную"])
@@ -232,14 +245,8 @@ with tab2:
         if raw_text:
             isins = re.split(r"[\s,;]+", raw_text)
             isins = [i.strip().upper() for i in isins if i.strip()]
-            results = []
             progress_bar = st.progress(0)
-            for idx, isin in enumerate(isins, start=1):
-                data = get_bond_data(isin)
-                if data:
-                    results.append(data)
-                progress_bar.progress(idx / len(isins))
-                time.sleep(0.1)
+            results = fetch_isins_parallel(isins)
             st.session_state["results"] = pd.DataFrame(results)
             st.success("✅ Данные успешно получены!")
 
@@ -256,14 +263,7 @@ if uploaded_file:
             st.error("❌ В файле должна быть колонка 'ISIN'.")
             st.stop()
         isins = df["ISIN"].dropna().unique().tolist()
-        results = []
-        progress_bar = st.progress(0)
-        for idx, isin in enumerate(isins, start=1):
-            data = get_bond_data(isin)
-            if data:
-                results.append(data)
-            progress_bar.progress(idx / len(isins))
-            time.sleep(0.1)
+        results = fetch_isins_parallel(isins)
         st.session_state["results"] = pd.DataFrame(results)
         st.success("✅ Данные успешно получены из файла!")
 
