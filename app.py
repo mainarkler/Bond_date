@@ -71,16 +71,12 @@ def safe_read_csv(path):
         st.warning(f"⚠️ Ошибка при чтении файла {os.path.basename(path)}: {e}")
         return pd.DataFrame()
 
-# === Загрузка справочников ===
-EMITTER_FILE = "https://raw.githubusercontent.com/mainarkler/Bond_date/main/Pifagr_name_with_emitter.csv"
-df_emitters = pd.read_csv(EMITTER_FILE)
-
 # === MOEX API ===
 session = requests.Session()
-session.headers.update({"User-Agent": "python-requests/iss-moex-emitter-id-script"})
+session.headers.update({"User-Agent": "python-requests/iss-moex-script"})
 
 # === Функция поиска SECID ===
-def fetch_emitter_id(isin: str, issuer_name: str = None):
+def fetch_sec_id(isin: str):
     isin = str(isin).strip()
     if not isin:
         return None
@@ -96,7 +92,7 @@ def fetch_emitter_id(isin: str, issuer_name: str = None):
         rows = securities.get("data", [])
         if rows:
             for i, c in enumerate(cols):
-                if c.upper() == "EMITTER_ID":
+                if c.upper() == "SECID":
                     return rows[0][i]
     except Exception:
         pass
@@ -109,86 +105,58 @@ def fetch_emitter_id(isin: str, issuer_name: str = None):
         root = ET.fromstring(r.content)
         for row in root.iter():
             name_attr = row.attrib.get("name") or row.attrib.get("NAME")
-            if name_attr and name_attr.upper() == "EMITTER_ID":
+            if name_attr and name_attr.upper() == "SECID":
                 return row.attrib.get("value") or row.attrib.get("VALUE")
     except Exception:
         pass
 
-    # --- Если эмитент Минфин России, ищем через TQOB ---
-    if issuer_name and "МИНФИН РОССИИ" in issuer_name.upper():
-        try:
-            url_tqob = "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQOB/securities.xml?iss.meta=off"
-            r = session.get(url_tqob, timeout=10)
-            r.raise_for_status()
-            root = ET.fromstring(r.content)
-            for row in root.iter("row"):
-                if row.attrib.get("isin") == isin:
-                    return row.attrib.get("emitterid") or row.attrib.get("EMITTERID")
-        except Exception:
-            pass
+    # --- Если стандартный запрос не дал данных, ищем в TQOB (для ОФЗ) ---
+    try:
+        url_tqob = "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQOB/securities.xml?iss.meta=off"
+        r = session.get(url_tqob, timeout=10)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        for row in root.iter("row"):
+            if row.attrib.get("isin") == isin:
+                return row.attrib.get("secid") or row.attrib.get("SECID")
+    except Exception:
+        pass
 
     return None
 
 # === Получение данных по ISIN ===
 def get_bond_data(isin):
     try:
-        # --- Попытка найти эмитента через справочник ---
-        emitter_id = fetch_emitter_id(isin)
-        emitter_name = None
-        if emitter_id and not df_emitters.empty:
-            match = df_emitters[df_emitters["EMITTER_ID"] == str(emitter_id)]
-            if not match.empty and "ISSUER" in match.columns:
-                emitter_name = match.iloc[0]["ISSUER"]
-
-        # Если эмитент Минфин России, нужно передать имя в fetch_emitter_id для TQOB
-        if not emitter_id and emitter_name and "МИНФИН РОССИИ" in emitter_name.upper():
-            emitter_id = fetch_emitter_id(isin, issuer_name=emitter_name)
+        secid = fetch_sec_id(isin)
 
         # --- Информация о бумаге ---
         secname = maturity_date = put_date = call_date = None
         success = False
 
-        # --- Стандартный запрос JSON ---
-        try:
-            url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{isin}.json"
-            response_info = requests.get(url_info, timeout=10)
-            if response_info.status_code == 200:
-                data_info = response_info.json()
-                rows_info = data_info.get("securities", {}).get("data", [])
-                cols_info = data_info.get("securities", {}).get("columns", [])
-                if rows_info:
-                    info = dict(zip(cols_info, rows_info[0]))
-                    secname = info.get("SECNAME")
-                    maturity_date = info.get("MATDATE")
-                    put_date = info.get("PUTOPTIONDATE")
-                    call_date = info.get("CALLOPTIONDATE")
-                    success = True
-        except Exception:
-            pass
-
-        # --- Если стандартный запрос не сработал, пробуем TQOB (для ОФЗ) ---
-        if not success and emitter_name and "МИНФИН РОССИИ" in emitter_name.upper():
+        # --- Стандартный запрос JSON по secid ---
+        if secid:
             try:
-                url_tqob_sec = "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQOB/securities.xml?iss.meta=off"
-                r = session.get(url_tqob_sec, timeout=10)
-                r.raise_for_status()
-                root = ET.fromstring(r.content)
-                for row in root.iter("row"):
-                    if row.attrib.get("isin") == isin:
-                        secname = row.attrib.get("SECNAME") or row.attrib.get("secname")
-                        maturity_date = row.attrib.get("MATDATE")
-                        put_date = row.attrib.get("PUTOPTIONDATE")
-                        call_date = row.attrib.get("CALLOPTIONDATE")
+                url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
+                response_info = requests.get(url_info, timeout=10)
+                if response_info.status_code == 200:
+                    data_info = response_info.json()
+                    rows_info = data_info.get("securities", {}).get("data", [])
+                    cols_info = data_info.get("securities", {}).get("columns", [])
+                    if rows_info:
+                        info = dict(zip(cols_info, rows_info[0]))
+                        secname = info.get("SECNAME")
+                        maturity_date = info.get("MATDATE")
+                        put_date = info.get("PUTOPTIONDATE")
+                        call_date = info.get("CALLOPTIONDATE")
                         success = True
-                        break
             except Exception:
                 pass
 
         # --- Купоны ---
         record_date = coupon_date = None
-        if success:
+        if success and secid:
             try:
-                url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{isin}.json?iss.only=coupons&iss.meta=off"
+                url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json?iss.only=coupons&iss.meta=off"
                 response_coupons = requests.get(url_coupons, timeout=10)
                 response_coupons.raise_for_status()
                 data_coupons = response_coupons.json()
@@ -221,8 +189,7 @@ def get_bond_data(isin):
 
         return {
             "ISIN": isin,
-            "Код эмитента": emitter_id,
-            "Наименование эмитента": emitter_name,
+            "SECID": secid,
             "Наименование инструмента": secname,
             "Дата погашения": fmt(maturity_date),
             "Дата оферты Put": fmt(put_date),
@@ -267,63 +234,4 @@ with tab2:
 # === Обработка файла ===
 if uploaded_file:
     if not st.session_state["file_loaded"] or uploaded_file.name != st.session_state["last_file_name"]:
-        st.session_state["file_loaded"] = True
-        st.session_state["last_file_name"] = uploaded_file.name
-        if uploaded_file.name.endswith(".csv"):
-            df = pd.read_csv(uploaded_file, dtype=str)
-        else:
-            df = pd.read_excel(uploaded_file, dtype=str)
-        if "ISIN" not in df.columns:
-            st.error("❌ В файле должна быть колонка 'ISIN'.")
-            st.stop()
-        isins = df["ISIN"].dropna().unique().tolist()
-        results = []
-        progress_bar = st.progress(0)
-        for idx, isin in enumerate(isins, start=1):
-            data = get_bond_data(isin)
-            if data:
-                results.append(data)
-            progress_bar.progress(idx / len(isins))
-            time.sleep(0.1)
-        st.session_state["results"] = pd.DataFrame(results)
-        st.success("✅ Данные успешно получены из файла!")
-
-# === Стилизация ===
-def style_df(row):
-    if (pd.isna(row["Наименование инструмента"]) or row["Наименование инструмента"] in [None, "None", ""]):
-        return ["background-color: DimGray; color: white"] * len(row)
-    today = datetime.today().date()
-    danger_threshold = today + timedelta(days=days_threshold)
-    key_dates = ["Дата погашения", "Дата оферты Put", "Дата оферты Call", "Дата фиксации купона", "Дата купона"]
-    colors = ["" for _ in row]
-    for i, col in enumerate(row.index):
-        if col in key_dates and pd.notnull(row[col]):
-            try:
-                d = pd.to_datetime(row[col]).date()
-                if d <= danger_threshold:
-                    colors[i] = "background-color: Chocolate"
-            except:
-                pass
-    if any(c == "background-color: Chocolate" for c in colors):
-        colors = ["background-color: SandyBrown" if c == "" else c for c in colors]
-    return colors
-
-# === Вывод результатов ===
-if st.session_state["results"] is not None:
-    df_res = st.session_state["results"]
-    st.dataframe(df_res.style.apply(style_df, axis=1), use_container_width=True)
-
-    def to_excel(df):
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Данные")
-        return output.getvalue()
-
-    st.download_button(
-        label="💾 Скачать результат (Excel)",
-        data=to_excel(df_res),
-        file_name="bond_data.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-else:
-    st.info("👆 Загрузите файл или введите ISIN-ы вручную.")
+        st.session_state["file_loaded
