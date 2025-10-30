@@ -75,20 +75,21 @@ def safe_read_csv(path):
 session = requests.Session()
 session.headers.update({"User-Agent": "python-requests/iss-moex-script"})
 
-# === Кэширование TQOB XML ===
+# === Кэширование XML TQOB и TQCB ===
 @st.cache_data(ttl=3600)
-def fetch_tqob_xml():
-    url_tqob = "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQOB/securities.xml?iss.meta=off"
-    r = session.get(url_tqob, timeout=20)
+def fetch_board_xml(board):
+    url = f"https://iss.moex.com/iss/engines/stock/markets/bonds/boards/{board}/securities.xml?iss.meta=off"
+    r = session.get(url, timeout=20)
     r.raise_for_status()
     return ET.fromstring(r.content)
 
-tqob_root = fetch_tqob_xml()
+tqob_root = fetch_board_xml("TQOB")
+tqcb_root = fetch_board_xml("TQCB")
 
 # === Функция поиска эмитента и SECID ===
 @st.cache_data(ttl=3600)
 def fetch_emitter_and_secid(isin: str):
-    isin = str(isin).strip()
+    isin = str(isin).strip().upper()
     if not isin:
         return None, None
 
@@ -129,25 +130,29 @@ def fetch_emitter_and_secid(isin: str):
                         secid = row.attrib.get("value") or row.attrib.get("VALUE")
         except Exception:
             pass
-    
-    # --- TQOB для ОФЗ ---
+
+    # --- Проверка в TQOB и TQCB ---
     if not secid or not emitter_id:
-        isin_clean = isin.strip().upper()
-        for row in tqob_root.iter("row"):
-            xml_isin = (row.attrib.get("isin") or "").strip().upper()
-            if xml_isin == isin_clean:
-                if not secid:
-                    secid = row.attrib.get("secid") or row.attrib.get("SECID")
-                if not emitter_id:
-                    emitter_id = row.attrib.get("emitterid") or row.attrib.get("EMITTERID")
+        for root_source in [tqob_root, tqcb_root]:
+            for row in root_source.iter("row"):
+                xml_isin = (row.attrib.get("isin") or "").strip().upper()
+                if xml_isin == isin:
+                    if not secid:
+                        secid = row.attrib.get("secid") or row.attrib.get("SECID")
+                    if not emitter_id:
+                        emitter_id = row.attrib.get("emitterid") or row.attrib.get("EMITTERID")
+                    break
+            if secid and emitter_id:
                 break
+
+    return emitter_id, secid
 
 # === Получение данных по ISIN ===
 def get_bond_data(isin):
     try:
         emitter_id, secid = fetch_emitter_and_secid(isin)
         secname = maturity_date = put_date = call_date = None
-        success = False
+        record_date = coupon_date = None
 
         # --- Информация о бумаге по SECID ---
         if secid:
@@ -164,13 +169,11 @@ def get_bond_data(isin):
                         maturity_date = info.get("MATDATE")
                         put_date = info.get("PUTOPTIONDATE")
                         call_date = info.get("CALLOPTIONDATE")
-                        success = True
             except Exception:
                 pass
 
         # --- Купоны ---
-        record_date = coupon_date = None
-        if success and secid:
+        if secid:
             try:
                 url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json?iss.only=coupons&iss.meta=off"
                 r = session.get(url_coupons, timeout=10)
@@ -192,7 +195,7 @@ def get_bond_data(isin):
                     record_date = next_date("recorddate")
                     coupon_date = next_date("coupondate")
             except Exception:
-                record_date = coupon_date = None
+                pass
 
         def fmt(date):
             if pd.isna(date) or not date:
@@ -204,8 +207,8 @@ def get_bond_data(isin):
 
         return {
             "ISIN": isin,
-            "Код эмитента": emitter_id,
-            "Наименование инструмента": secname,
+            "Код эмитента": emitter_id or "",
+            "Наименование инструмента": secname or "",
             "Дата погашения": fmt(maturity_date),
             "Дата оферты Put": fmt(put_date),
             "Дата оферты Call": fmt(call_date),
@@ -215,7 +218,16 @@ def get_bond_data(isin):
 
     except Exception as e:
         st.warning(f"Ошибка при обработке {isin}: {e}")
-        return None
+        return {
+            "ISIN": isin,
+            "Код эмитента": "",
+            "Наименование инструмента": "",
+            "Дата погашения": None,
+            "Дата оферты Put": None,
+            "Дата оферты Call": None,
+            "Дата фиксации купона": None,
+            "Дата купона": None,
+        }
 
 # === Параллельная обработка ===
 def fetch_isins_parallel(isins):
@@ -236,17 +248,12 @@ with tab1:
     uploaded_file = st.file_uploader("Загрузите Excel или CSV с колонкой ISIN", type=["xlsx", "xls", "csv"])
 
 with tab2:
-    isin_input = st.text_area(
-        "Введите или вставьте ISIN (через Ctrl+V, пробел или запятую)",
-        placeholder="ISINs",
-        height=150
-    )
+    isin_input = st.text_area("Введите или вставьте ISIN (через Ctrl+V, пробел или запятую)", height=150)
     if st.button("🔍 Получить данные по введённым ISIN"):
         raw_text = isin_input.strip()
         if raw_text:
             isins = re.split(r"[\s,;]+", raw_text)
             isins = [i.strip().upper() for i in isins if i.strip()]
-            progress_bar = st.progress(0)
             results = fetch_isins_parallel(isins)
             st.session_state["results"] = pd.DataFrame(results)
             st.success("✅ Данные успешно получены!")
@@ -282,9 +289,9 @@ def fetch_emitter_names():
 
 df_emitters = fetch_emitter_names()
 
-# === Стилизация ===
+# === Стилизация таблицы ===
 def style_df(row):
-    if (pd.isna(row["Наименование инструмента"]) or row["Наименование инструмента"] in [None, "None", ""]):
+    if pd.isna(row["Наименование инструмента"]) or row["Наименование инструмента"] in [None, "None", ""]:
         return ["background-color: DimGray; color: white"] * len(row)
     today = datetime.today().date()
     danger_threshold = today + timedelta(days=days_threshold)
@@ -306,21 +313,21 @@ def style_df(row):
 if st.session_state["results"] is not None:
     df_res = st.session_state["results"]
 
-    # === Добавление столбца 'Эмитент' вторым ===
-    if not df_emitters.empty:
+    if "Код эмитента" in df_res.columns and not df_emitters.empty:
         df_res = df_res.merge(df_emitters, how="left", left_on="Код эмитента", right_on="EMITTER_ID")
         df_res["Эмитент"] = df_res["Issuer"]
         df_res.drop(columns=["Issuer", "EMITTER_ID"], inplace=True, errors="ignore")
-        
-        # Переставляем 'Эмитент' сразу после 'Код эмитента'
+
         cols = df_res.columns.tolist()
         if "Эмитент" in cols and "Код эмитента" in cols:
             cols.remove("Эмитент")
             idx = cols.index("Код эмитента")
             cols.insert(idx + 1, "Эмитент")
             df_res = df_res[cols]
-        
+
         st.session_state["results"] = df_res
+    else:
+        st.warning("⚠️ В данных нет колонки 'Код эмитента' — объединение со справочником пропущено.")
 
     st.dataframe(df_res.style.apply(style_df, axis=1), use_container_width=True)
 
