@@ -267,6 +267,20 @@ if uploaded_file:
         st.session_state["results"] = pd.DataFrame(results)
         st.success("✅ Данные успешно получены из файла!")
 
+# === Подгрузка справочника эмитентов ===
+@st.cache_data(ttl=3600)
+def fetch_emitter_names():
+    url = "https://raw.githubusercontent.com/mainarkler/Bond_date/refs/heads/main/Pifagr_name_with_emitter.csv"
+    try:
+        df_emitters = pd.read_csv(url, dtype=str)
+        df_emitters.columns = [c.strip() for c in df_emitters.columns]
+        return df_emitters
+    except Exception as e:
+        st.warning(f"⚠️ Не удалось загрузить справочник эмитентов: {e}")
+        return pd.DataFrame(columns=["Issuer", "EMITTER_ID"])
+
+df_emitters = fetch_emitter_names()
+
 # === Стилизация ===
 def style_df(row):
     if (pd.isna(row["Наименование инструмента"]) or row["Наименование инструмента"] in [None, "None", ""]):
@@ -290,6 +304,14 @@ def style_df(row):
 # === Вывод результатов ===
 if st.session_state["results"] is not None:
     df_res = st.session_state["results"]
+
+    # === Добавление столбца 'Эмитент' ===
+    if not df_emitters.empty:
+        df_res = df_res.merge(df_emitters, how="left", left_on="Код эмитента", right_on="EMITTER_ID")
+        df_res["Эмитент"] = df_res["Issuer"]
+        df_res.drop(columns=["Issuer", "EMITTER_ID"], inplace=True, errors="ignore")
+        st.session_state["results"] = df_res
+
     st.dataframe(df_res.style.apply(style_df, axis=1), use_container_width=True)
 
     def to_excel(df):
