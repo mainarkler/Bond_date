@@ -75,16 +75,54 @@ def safe_read_csv(path):
 session = requests.Session()
 session.headers.update({"User-Agent": "python-requests/iss-moex-script"})
 
-# === Кэширование XML TQOB и TQCB ===
+# === Полная выгрузка XML по TQOB ===
 @st.cache_data(ttl=3600)
-def fetch_board_xml(board):
-    url = f"https://iss.moex.com/iss/engines/stock/markets/bonds/boards/{board}/securities.xml?iss.meta=off"
-    r = session.get(url, timeout=20)
-    r.raise_for_status()
-    return ET.fromstring(r.content)
+def fetch_full_tqob_xml():
+    """
+    Выгружает все строки с доски TQOB (все страницы)
+    и объединяет их в один XML-объект для поиска ISIN → SECID.
+    """
+    base_url = "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/TQOB/securities.xml"
+    all_rows = []
+    start = 0
+    step = 500  # стандартный лимит API
+    total_rows = None
 
-tqob_root = fetch_board_xml("TQOB")
-tqcb_root = fetch_board_xml("TQCB")
+    while True:
+        url = f"{base_url}?iss.meta=off&start={start}"
+        r = session.get(url, timeout=20)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+
+        # Найдем все строки
+        rows = list(root.iter("row"))
+        if not rows:
+            break
+        all_rows.extend(rows)
+
+        # Определим общее количество строк из атрибута "total" (если есть)
+        if total_rows is None:
+            for data in root.iter("data"):
+                if data.attrib.get("id") == "securities":
+                    total_rows = int(data.attrib.get("total", "0"))
+                    break
+
+        # Если всё выгрузили — останавливаемся
+        if total_rows and start + step >= total_rows:
+            break
+
+        start += step
+
+    # Собираем единый XML с тем же тегом верхнего уровня
+    combined_root = ET.Element("data")
+    for row in all_rows:
+        combined_root.append(row)
+
+    return combined_root
+
+
+# Кэшируем результат
+tqob_root = fetch_full_tqob_xml()
 
 # === Функция поиска эмитента и SECID ===
 @st.cache_data(ttl=3600)
