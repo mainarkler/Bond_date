@@ -77,28 +77,36 @@ session.headers.update({"User-Agent": "python-requests/iss-moex-script"})
 
 # === Кэширование XML TQOB и TQCB (исправленный парсинг) ===
 @st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600)
 def fetch_board_xml(board: str):
-    """Загружает XML с MOEX и возвращает словарь ISIN -> SECID."""
+    """Загружает XML с MOEX и возвращает словарь ISIN -> SECID (устойчиво к namespace и регистрам)."""
     url = f"https://iss.moex.com/iss/engines/stock/markets/bonds/boards/{board.lower()}/securities.xml?marketprice_board=3&iss.meta=off"
     try:
         r = session.get(url, timeout=20)
         r.raise_for_status()
-        root = ET.fromstring(r.content)
+        xml_content = r.content.decode("utf-8")
+
+        # убираем namespace, если есть
+        xml_content = re.sub(r'\sxmlns="[^"]+"', '', xml_content)
+        root = ET.fromstring(xml_content)
+
         mapping = {}
-        for row in root.iter("row"):
-            # MOEX XML использует ИМЕНА АТРИБУТОВ В ВЕРХНЕМ РЕГИСТРЕ
-            attrs = {k.upper(): v for k, v in row.attrib.items()}
-            isin = attrs.get("ISIN", "").strip().upper()
-            secid = attrs.get("SECID", "").strip().upper()
-            if isin and secid:
-                mapping[isin] = secid
+        for row in root.iter():
+            if row.tag.lower().endswith("row"):
+                attrs = {k.upper(): v for k, v in row.attrib.items()}
+                isin = attrs.get("ISIN", "").strip().upper()
+                secid = attrs.get("SECID", "").strip().upper()
+                if isin and secid:
+                    mapping[isin] = secid
         return mapping
+
     except Exception as e:
         st.warning(f"⚠️ Не удалось загрузить {board}: {e}")
         return {}
 TQOB_MAP = fetch_board_xml("tqob")
 TQCB_MAP = fetch_board_xml("tqcb")
 
+st.write("🔎 Проверка TQOB:", TQOB_MAP.get("RU000A101N52"))
 
 # === Функция поиска эмитента и SECID ===
 @st.cache_data(ttl=3600)
