@@ -171,75 +171,57 @@ def get_bond_data(isin):
             try:
                 url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
                 r = session.get(url_info, timeout=10)
-                if r.status_code == 200:
-                    data_info = r.json()
-                    rows_info = data_info.get("securities", {}).get("data", [])
-                    cols_info = data_info.get("securities", {}).get("columns", [])
-                    if rows_info:
-                        info = dict(zip(cols_info, rows_info[0]))
-                        secname = info.get("SECNAME") or info.get("SEC_NAME")
-                        maturity_date = info.get("MATDATE")
-                        put_date = info.get("PUTOPTIONDATE")
-                        call_date = info.get("CALLOPTIONDATE")
+                r.raise_for_status()
+                data_info = r.json()
+                rows_info = data_info.get("securities", {}).get("data", [])
+                cols_info = data_info.get("securities", {}).get("columns", [])
+                if rows_info:
+                    info = dict(zip(cols_info, rows_info[0]))
+                    secname = info.get("SECNAME") or info.get("SEC_NAME")
+                    maturity_date = info.get("MATDATE")
+                    put_date = info.get("PUTOPTIONDATE")
+                    call_date = info.get("CALLOPTIONDATE")
             except Exception:
                 pass
 
-# --- Купоны ---
-if secid:
-    try:
-        url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json?iss.only=coupons&iss.meta=off"
-        r = session.get(url_coupons, timeout=10)
-        r.raise_for_status()
-        data_coupons = r.json()
-        coupons = data_coupons.get("coupons", {}).get("data", [])
-        columns_coupons = data_coupons.get("coupons", {}).get("columns", [])
+            # --- Купоны ---
+            try:
+                url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json?iss.only=coupons&iss.meta=off"
+                r = session.get(url_coupons, timeout=10)
+                r.raise_for_status()
+                data_coupons = r.json()
+                coupons = data_coupons.get("coupons", {}).get("data", [])
+                columns_coupons = data_coupons.get("coupons", {}).get("columns", [])
 
-        record_date = coupon_date = None
+                if coupons and columns_coupons:
+                    df_coupons = pd.DataFrame(coupons, columns=columns_coupons)
+                    today = pd.to_datetime(datetime.today().date())
 
-        if coupons and columns_coupons:
-            df_coupons = pd.DataFrame(coupons, columns=columns_coupons)
-            today = pd.to_datetime(datetime.today().date())
+                    idx_record = columns_coupons.index("RECORDDATE") if "RECORDDATE" in columns_coupons else None
+                    idx_coupon = columns_coupons.index("COUPONDATE") if "COUPONDATE" in columns_coupons else None
 
-            # Определяем индекс колонок
-            idx_record = columns_coupons.index("RECORDDATE") if "RECORDDATE" in columns_coupons else None
-            idx_coupon = columns_coupons.index("COUPONDATE") if "COUPONDATE" in columns_coupons else None
+                    if idx_record is not None:
+                        future_records = pd.to_datetime(df_coupons.iloc[:, idx_record], errors="coerce")
+                        future_records = future_records[future_records >= today]
+                        record_date = future_records.min() if not future_records.empty else None
 
-            # Фильтруем будущие даты
-            if idx_record is not None:
-                future_records = pd.to_datetime(df_coupons.iloc[:, idx_record], errors="coerce")
-                future_records = future_records[future_records >= today]
-                record_date = future_records.min() if not future_records.empty else None
+                    if idx_coupon is not None:
+                        future_coupons = pd.to_datetime(df_coupons.iloc[:, idx_coupon], errors="coerce")
+                        future_coupons = future_coupons[future_coupons >= today]
+                        coupon_date = future_coupons.min() if not future_coupons.empty else None
 
-            if idx_coupon is not None:
-                future_coupons = pd.to_datetime(df_coupons.iloc[:, idx_coupon], errors="coerce")
-                future_coupons = future_coupons[future_coupons >= today]
-                coupon_date = future_coupons.min() if not future_coupons.empty else None
+                # fallback на XML-борды
+                if not record_date or not coupon_date:
+                    m = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
+                    if m:
+                        if not record_date:
+                            record_date = m.get("RECORDDATE")
+                        if not coupon_date:
+                            coupon_date = m.get("COUPONDATE")
+            except Exception:
+                record_date = coupon_date = None
 
-        # fallback на XML-борды
-        if not record_date or not coupon_date:
-            m = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
-            if m:
-                if not record_date:
-                    record_date = m.get("RECORDDATE")
-                if not coupon_date:
-                    coupon_date = m.get("COUPONDATE")
-
-    except Exception as e:
-        st.warning(f"⚠️ Ошибка при получении купонов для {isin}: {e}")
-        record_date = coupon_date = None
-
-        # fallback на XML-борды
-        if not record_date or not coupon_date:
-            m = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
-            if m:
-                if not record_date:
-                    record_date = m.get("RECORDDATE")
-                if not coupon_date:
-                    coupon_date = m.get("COUPONDATE")
-
-    except Exception:
-        pass
-
+        # --- Форматирование дат ---
         def fmt(date):
             if pd.isna(date) or not date:
                 return None
@@ -258,7 +240,6 @@ if secid:
             "Дата фиксации купона": fmt(record_date),
             "Дата купона": fmt(coupon_date),
         }
-
 
     except Exception as e:
         st.warning(f"Ошибка при обработке {isin}: {e}")
