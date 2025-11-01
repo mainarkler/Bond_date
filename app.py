@@ -184,30 +184,48 @@ def get_bond_data(isin):
             except Exception:
                 pass
 
-        # --- Купоны ---
-        if secid:
-            try:
-                url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json?iss.only=coupons&iss.meta=off"
-                r = session.get(url_coupons, timeout=10)
-                r.raise_for_status()
-                data_coupons = r.json()
-                coupons = data_coupons.get("coupons", {}).get("data", [])
-                columns_coupons = data_coupons.get("coupons", {}).get("columns", [])
-                if coupons:
-                    df_coupons = pd.DataFrame(coupons, columns=columns_coupons)
-                    today = pd.to_datetime(datetime.today().date())
+# --- Купоны ---
+if secid:
+    try:
+        url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json?iss.only=coupons&iss.meta=off"
+        r = session.get(url_coupons, timeout=10)
+        r.raise_for_status()
+        data_coupons = r.json()
+        coupons = data_coupons.get("coupons", {}).get("data", [])
+        columns_coupons = data_coupons.get("coupons", {}).get("columns", [])
 
-                    def next_date(col):
-                        if col in df_coupons:
-                            future = pd.to_datetime(df_coupons[col], errors="coerce")
-                            future = future[future >= today]
-                            return future.min() if not future.empty else None
-                        return None
+        record_date = coupon_date = None
 
-                    record_date = next_date("recorddate")
-                    coupon_date = next_date("coupondate")
-            except Exception:
-                pass
+        if coupons and columns_coupons:
+            df_coupons = pd.DataFrame(coupons, columns=columns_coupons)
+            today = pd.to_datetime(datetime.today().date())
+
+            # Определяем индекс колонок
+            idx_record = columns_coupons.index("RECORDDATE") if "RECORDDATE" in columns_coupons else None
+            idx_coupon = columns_coupons.index("COUPONDATE") if "COUPONDATE" in columns_coupons else None
+
+            # Фильтруем будущие даты
+            if idx_record is not None:
+                future_records = pd.to_datetime(df_coupons.iloc[:, idx_record], errors="coerce")
+                future_records = future_records[future_records >= today]
+                record_date = future_records.min() if not future_records.empty else None
+
+            if idx_coupon is not None:
+                future_coupons = pd.to_datetime(df_coupons.iloc[:, idx_coupon], errors="coerce")
+                future_coupons = future_coupons[future_coupons >= today]
+                coupon_date = future_coupons.min() if not future_coupons.empty else None
+
+        # fallback на XML-борды
+        if not record_date or not coupon_date:
+            m = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
+            if m:
+                if not record_date:
+                    record_date = m.get("RECORDDATE")
+                if not coupon_date:
+                    coupon_date = m.get("COUPONDATE")
+
+    except Exception:
+        pass
 
         def fmt(date):
             if pd.isna(date) or not date:
@@ -227,6 +245,7 @@ def get_bond_data(isin):
             "Дата фиксации купона": fmt(record_date),
             "Дата купона": fmt(coupon_date),
         }
+
 
     except Exception as e:
         st.warning(f"Ошибка при обработке {isin}: {e}")
