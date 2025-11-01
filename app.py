@@ -58,7 +58,6 @@ def safe_read_csv(path):
     try:
         with open(path, "r", encoding="utf-8-sig") as f:
             content = f.read()
-        # убираем лишние кавычки, но аккуратно — не ломаем CSV
         content = content.replace('\r\n', '\n').strip()
         sample = content[:2048]
         try:
@@ -80,25 +79,16 @@ session.headers.update({"User-Agent": "python-requests/iss-moex-script"})
 # === Кэширование XML TQOB и TQCB (устойчивый парсинг) ===
 @st.cache_data(ttl=3600)
 def fetch_board_xml(board: str):
-    """
-    Загружает XML-выгрузку MOEX для board (tqob/tqcb) и возвращает словарь ISIN -> атрибутная карта (dict)
-    Для простоты мы сохраняем secid и emitterid (если есть).
-    """
     url = f"https://iss.moex.com/iss/engines/stock/markets/bonds/boards/{board.lower()}/securities.xml?marketprice_board=3&iss.meta=off"
     try:
         r = session.get(url, timeout=20)
         r.raise_for_status()
         xml_content = r.content.decode("utf-8", errors="ignore")
-
-        # убрать namespace, если есть (позволяет безопасно парсить тег row)
         xml_content = re.sub(r'\sxmlns="[^"]+"', "", xml_content, count=1)
         root = ET.fromstring(xml_content)
-
-        mapping = {}  # ISIN -> { "SECID": secid, "EMITTERID": emitterid, ... }
+        mapping = {}
         for el in root.iter():
-            # тег может быть '{...}row' — проверяем окончание
             if el.tag.lower().endswith("row"):
-                # приводим ключи атрибутов к верхнему регистру для надежности
                 attrs = {k.upper(): v for k, v in el.attrib.items()}
                 isin = attrs.get("ISIN", "").strip().upper()
                 secid = attrs.get("SECID", "").strip().upper()
@@ -113,28 +103,54 @@ def fetch_board_xml(board: str):
 TQOB_MAP = fetch_board_xml("tqob")
 TQCB_MAP = fetch_board_xml("tqcb")
 
-# отладочный вывод (удали или закомментируй в продакшн)
-st.write("🔎 Проверка TQOB (пример):", TQOB_MAP.get("RU000A101N52"))
+# === Дополнительная функция для купонов и эмитента ===
+@st.cache_data(ttl=3600)
+def fetch_coupon_and_emitter(secid: str):
+    """Получает код эмитента и ближайшую дату купона по SECID."""
+    base_url = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}/.json"
+    params = {"iss.only": "coupons", "iss.meta": "off"}
+    try:
+        r = session.get(base_url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        coupons = data.get("coupons", {})
+        cols = coupons.get("columns", [])
+        rows = coupons.get("data", [])
+        if not rows:
+            return None, None
+
+        idx_coupondate = cols.index("coupondate") if "coupondate" in cols else None
+        idx_secid = cols.index("secid") if "secid" in cols else None
+
+        coupon_dates = []
+        for row in rows:
+            if idx_coupondate is not None and row[idx_coupondate]:
+                try:
+                    d = datetime.strptime(row[idx_coupondate], "%Y-%m-%d")
+                    if d >= datetime.now():
+                        coupon_dates.append(d)
+                except:
+                    pass
+
+        next_coupon = min(coupon_dates) if coupon_dates else None
+        emitter_code = rows[0][idx_secid] if idx_secid is not None else None
+
+        return emitter_code, next_coupon.strftime("%Y-%m-%d") if next_coupon else None
+
+    except Exception as e:
+        st.warning(f"⚠️ Ошибка при получении купонов для {secid}: {e}")
+        return None, None
 
 # === Функция поиска эмитента и SECID ===
 @st.cache_data(ttl=3600)
 def fetch_emitter_and_secid(isin: str):
-    """
-    Возвращает (emitter_id, secid).
-    Логика:
-      1) прямой запрос /iss/securities/{isin}.json
-      2) прямой xml /iss/securities/{isin}.xml
-      3) поиск в TQOB/TQCB мапах
-      4) поиск через /iss/securities.json?q={isin}
-    """
     isin = str(isin).strip().upper()
     if not isin:
         return None, None
-
     emitter_id = None
     secid = None
 
-    # --- 1) прямой JSON ---
+    # 1) JSON
     try:
         url = f"https://iss.moex.com/iss/securities/{isin}.json"
         r = session.get(url, timeout=10)
@@ -144,88 +160,39 @@ def fetch_emitter_and_secid(isin: str):
         cols = securities.get("columns", [])
         rows = securities.get("data", [])
         if rows:
-            # берем только первую строку
             first = rows[0]
             col_map = {c.upper(): i for i, c in enumerate(cols)}
-            if "EMITTER_ID" in col_map:
-                emitter_id = first[col_map["EMITTER_ID"]]
-            if "SECID" in col_map:
-                secid = first[col_map["SECID"]]
+            emitter_id = first[col_map.get("EMITTER_ID", -1)] if "EMITTER_ID" in col_map else None
+            secid = first[col_map.get("SECID", -1)] if "SECID" in col_map else None
     except Exception:
-        # молча пропускаем — переходи к следующему шагу
         pass
 
-    # --- 2) прямой XML ---
-    if not emitter_id or not secid:
+    # 2) XML
+    if not secid:
         try:
             url = f"https://iss.moex.com/iss/securities/{isin}.xml?iss.meta=off"
             r = session.get(url, timeout=10)
             r.raise_for_status()
-            # возможно есть namespace — удаляем
             xml_content = r.content.decode("utf-8", errors="ignore")
             xml_content = re.sub(r'\sxmlns="[^"]+"', "", xml_content, count=1)
             root = ET.fromstring(xml_content)
-            # поиск пар 'name'='EMITTER_ID' и 'name'='SECID' в result xml
             for node in root.iter():
-                # элементы в xml могут иметь атрибуты name / value
-                name_attr = (node.attrib.get("name") or node.attrib.get("NAME") or "").strip().upper()
-                value_attr = (node.attrib.get("value") or node.attrib.get("VALUE") or "").strip()
-                if name_attr == "EMITTER_ID" and not emitter_id:
-                    emitter_id = value_attr
-                if name_attr == "SECID" and not secid:
-                    secid = value_attr
-                # если нашли оба — можно прервать
-                if emitter_id and secid:
-                    break
+                name_attr = (node.attrib.get("name") or "").upper()
+                val_attr = node.attrib.get("value") or ""
+                if name_attr == "SECID":
+                    secid = val_attr
+                elif name_attr == "EMITTER_ID":
+                    emitter_id = val_attr
         except Exception:
             pass
 
-    # --- 3) поиск в TQOB / TQCB ---
+    # 3) XML-борды
     if not secid:
-        m = TQOB_MAP.get(isin)
-        if m and m.get("SECID"):
+        m = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
+        if m:
             secid = m.get("SECID")
             if not emitter_id:
                 emitter_id = m.get("EMITTERID")
-        else:
-            m2 = TQCB_MAP.get(isin)
-            if m2 and m2.get("SECID"):
-                secid = m2.get("SECID")
-                if not emitter_id:
-                    emitter_id = m2.get("EMITTERID")
-
-    # --- 4) глобальный поиск по q= (иногда помогает) ---
-    if not secid:
-        try:
-            url = f"https://iss.moex.com/iss/securities.json?q={isin}&iss.meta=off"
-            r = session.get(url, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            securities = data.get("securities", {})
-            cols = securities.get("columns", [])
-            rows = securities.get("data", [])
-            if rows:
-                col_map = {c.upper(): i for i, c in enumerate(cols)}
-                for row in rows:
-                    # иногда isin может быть не точным - проверяем вхождение
-                    row_isin = None
-                    if "ISIN" in col_map:
-                        row_isin = (row[col_map["ISIN"]] or "").strip().upper()
-                    if row_isin == isin or isin in [str(x).strip().upper() for x in row]:
-                        if "SECID" in col_map:
-                            secid = row[col_map["SECID"]]
-                        if "EMITTER_ID" in col_map and not emitter_id:
-                            emitter_id = row[col_map["EMITTER_ID"]]
-                        if secid:
-                            break
-        except Exception:
-            pass
-
-    # нормализуем пустые строки в None
-    if emitter_id == "":
-        emitter_id = None
-    if secid == "":
-        secid = None
 
     return emitter_id, secid
 
@@ -247,8 +214,7 @@ def get_bond_data(isin):
                     cols_info = data_info.get("securities", {}).get("columns", [])
                     if rows_info:
                         info = dict(zip(cols_info, rows_info[0]))
-                        # ключи в JSON приходят в исходном регистре — используем как есть и в upper-версии
-                        secname = info.get("SECNAME") or info.get("SEC_NAME") or info.get("SECNAME".lower())
+                        secname = info.get("SECNAME") or info.get("SEC_NAME")
                         maturity_date = info.get("MATDATE")
                         put_date = info.get("PUTOPTIONDATE")
                         call_date = info.get("CALLOPTIONDATE")
@@ -257,28 +223,10 @@ def get_bond_data(isin):
 
         # --- Купоны ---
         if secid:
-            try:
-                url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{secid}.json?iss.only=coupons&iss.meta=off"
-                r = session.get(url_coupons, timeout=10)
-                r.raise_for_status()
-                data_coupons = r.json()
-                coupons = data_coupons.get("coupons", {}).get("data", [])
-                columns_coupons = data_coupons.get("coupons", {}).get("columns", [])
-                if coupons:
-                    df_coupons = pd.DataFrame(coupons, columns=columns_coupons)
-                    today = pd.to_datetime(datetime.today().date())
-
-                    def next_date(col):
-                        if col in df_coupons:
-                            future = pd.to_datetime(df_coupons[col], errors="coerce")
-                            future = future[future >= today]
-                            return future.min() if not future.empty else None
-                        return None
-
-                    record_date = next_date("recorddate")
-                    coupon_date = next_date("coupondate")
-            except Exception:
-                pass
+            emitter_from_coupon, next_coupon_date = fetch_coupon_and_emitter(secid)
+            if not emitter_id and emitter_from_coupon:
+                emitter_id = emitter_from_coupon
+            coupon_date = next_coupon_date
 
         def fmt(date):
             if pd.isna(date) or not date:
@@ -295,22 +243,12 @@ def get_bond_data(isin):
             "Дата погашения": fmt(maturity_date),
             "Дата оферты Put": fmt(put_date),
             "Дата оферты Call": fmt(call_date),
-            "Дата фиксации купона": fmt(record_date),
             "Дата купона": fmt(coupon_date),
         }
 
     except Exception as e:
         st.warning(f"Ошибка при обработке {isin}: {e}")
-        return {
-            "ISIN": isin,
-            "Код эмитента": "",
-            "Наименование инструмента": "",
-            "Дата погашения": None,
-            "Дата оферты Put": None,
-            "Дата оферты Call": None,
-            "Дата фиксации купона": None,
-            "Дата купона": None,
-        }
+        return {"ISIN": isin, "Код эмитента": "", "Наименование инструмента": "", "Дата погашения": None}
 
 # === Параллельная обработка ===
 def fetch_isins_parallel(isins):
