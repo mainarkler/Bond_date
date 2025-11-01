@@ -75,10 +75,10 @@ def safe_read_csv(path):
 session = requests.Session()
 session.headers.update({"User-Agent": "python-requests/iss-moex-script"})
 
-# === Кэширование XML TQOB и TQCB (упрощённое и оптимизированное) ===
+# === Кэширование XML TQOB и TQCB (исправленный парсинг) ===
 @st.cache_data(ttl=3600)
 def fetch_board_xml(board: str):
-    """Загружает XML с MOEX и возвращает словарь ISIN -> SECID"""
+    """Загружает XML с MOEX и возвращает словарь ISIN -> SECID."""
     url = f"https://iss.moex.com/iss/engines/stock/markets/bonds/boards/{board.lower()}/securities.xml?marketprice_board=3&iss.meta=off"
     try:
         r = session.get(url, timeout=20)
@@ -86,15 +86,16 @@ def fetch_board_xml(board: str):
         root = ET.fromstring(r.content)
         mapping = {}
         for row in root.iter("row"):
-            isin = (row.attrib.get("isin") or "").strip().upper()
-            secid = (row.attrib.get("secid") or "").strip().upper()
+            # MOEX XML использует ИМЕНА АТРИБУТОВ В ВЕРХНЕМ РЕГИСТРЕ
+            attrs = {k.upper(): v for k, v in row.attrib.items()}
+            isin = attrs.get("ISIN", "").strip().upper()
+            secid = attrs.get("SECID", "").strip().upper()
             if isin and secid:
                 mapping[isin] = secid
         return mapping
     except Exception as e:
         st.warning(f"⚠️ Не удалось загрузить {board}: {e}")
         return {}
-
 TQOB_MAP = fetch_board_xml("tqob")
 TQCB_MAP = fetch_board_xml("tqcb")
 
