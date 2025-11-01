@@ -224,6 +224,19 @@ if secid:
                 if not coupon_date:
                     coupon_date = m.get("COUPONDATE")
 
+    except Exception as e:
+        st.warning(f"⚠️ Ошибка при получении купонов для {isin}: {e}")
+        record_date = coupon_date = None
+
+        # fallback на XML-борды
+        if not record_date or not coupon_date:
+            m = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
+            if m:
+                if not record_date:
+                    record_date = m.get("RECORDDATE")
+                if not coupon_date:
+                    coupon_date = m.get("COUPONDATE")
+
     except Exception:
         pass
 
