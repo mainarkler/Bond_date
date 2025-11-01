@@ -78,7 +78,7 @@ session.headers.update({"User-Agent": "python-requests/iss-moex-script"})
 # === Кэширование XML TQOB и TQCB ===
 @st.cache_data(ttl=3600)
 def fetch_board_xml(board):
-    url = f"https://iss.moex.com/iss/engines/stock/markets/bonds/boards/{board}/securities.xml?iss.meta=off"
+    url = f"https://iss.moex.com/iss/engines/stock/markets/bonds/boards/{board}/securities.xml?marketprice_board=3&iss.meta=off"
     r = session.get(url, timeout=20)
     r.raise_for_status()
     return ET.fromstring(r.content)
