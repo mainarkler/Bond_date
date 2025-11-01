@@ -75,16 +75,29 @@ def safe_read_csv(path):
 session = requests.Session()
 session.headers.update({"User-Agent": "python-requests/iss-moex-script"})
 
-# === Кэширование XML TQOB и TQCB ===
+# === Кэширование XML TQOB и TQCB (упрощённое и оптимизированное) ===
 @st.cache_data(ttl=3600)
-def fetch_board_xml(board):
-    url = f"https://iss.moex.com/iss/engines/stock/markets/bonds/boards/{board}/securities.xml?marketprice_board=3&iss.meta=off"
-    r = session.get(url, timeout=20)
-    r.raise_for_status()
-    return ET.fromstring(r.content)
+def fetch_board_xml(board: str):
+    """Загружает XML с MOEX и возвращает словарь ISIN -> SECID"""
+    url = f"https://iss.moex.com/iss/engines/stock/markets/bonds/boards/{board.lower()}/securities.xml?marketprice_board=3&iss.meta=off"
+    try:
+        r = session.get(url, timeout=20)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        mapping = {}
+        for row in root.iter("row"):
+            isin = (row.attrib.get("isin") or "").strip().upper()
+            secid = (row.attrib.get("secid") or "").strip().upper()
+            if isin and secid:
+                mapping[isin] = secid
+        return mapping
+    except Exception as e:
+        st.warning(f"⚠️ Не удалось загрузить {board}: {e}")
+        return {}
 
-tqob_root = fetch_board_xml("TQOB")
-tqcb_root = fetch_board_xml("TQCB")
+TQOB_MAP = fetch_board_xml("tqob")
+TQCB_MAP = fetch_board_xml("tqcb")
+
 
 # === Функция поиска эмитента и SECID ===
 @st.cache_data(ttl=3600)
@@ -131,19 +144,12 @@ def fetch_emitter_and_secid(isin: str):
         except Exception:
             pass
 
-    # --- Проверка в TQOB и TQCB ---
-    if not secid or not emitter_id:
-        for root_source in [tqob_root, tqcb_root]:
-            for row in root_source.iter("row"):
-                xml_isin = (row.attrib.get("isin") or "").strip().upper()
-                if xml_isin == isin:
-                    if not secid:
-                        secid = row.attrib.get("secid") or row.attrib.get("SECID")
-                    if not emitter_id:
-                        emitter_id = row.attrib.get("emitterid") or row.attrib.get("EMITTERID")
-                    break
-            if secid and emitter_id:
-                break
+    # --- Проверка в TQOB и TQCB (fallback, если стандартный запрос не дал SECID) ---
+    if not secid:
+        if isin in TQOB_MAP:
+            secid = TQOB_MAP[isin]
+        elif isin in TQCB_MAP:
+            secid = TQCB_MAP[isin]
 
     return emitter_id, secid
 
