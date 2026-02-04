@@ -251,7 +251,6 @@ def get_bond_data(isin: str):
         coupon_value = None
         coupon_value_rub = None
         coupon_value_prc = None
-        coupon_source = None  # where currency/values came from
 
         # --- info by SECID if present ---
         if secid:
@@ -377,7 +376,6 @@ def get_bond_data(isin: str):
             # determine faceunit currency (currency of coupon)
             if bondization_faceunit:
                 coupon_currency = bondization_faceunit
-                coupon_source = "bondization(faceunit)"
             else:
                 # try to find FACEUNIT column in coupons
                 faceunit_cols = [c for c in df_coupons.columns if "FACEUNIT" in c or c == "FACEUNIT_S"]
@@ -386,7 +384,6 @@ def get_bond_data(isin: str):
                         vals = df_coupons[c].dropna().astype(str)
                         if not vals.empty and vals.iloc[0].strip():
                             coupon_currency = vals.iloc[0].strip()
-                            coupon_source = f"coupons::{c}"
                             break
 
             # find value columns
@@ -459,8 +456,6 @@ def get_bond_data(isin: str):
                 coupon_value = norm_str(chosen_row.get(val_col)) if val_col else None
                 coupon_value_rub = norm_str(chosen_row.get(val_rub_col)) if val_rub_col else None
                 coupon_value_prc = norm_str(chosen_row.get(val_prc_col)) if val_prc_col else None
-                if coupon_source is None:
-                    coupon_source = "coupons(row)"
 
         # fallback to board maps for dates/currency
         if (not record_date or not coupon_date or not coupon_currency) and (TQOB_MAP or TQCB_MAP):
@@ -472,7 +467,6 @@ def get_bond_data(isin: str):
                     coupon_date = m.get("COUPONDATE") or m.get("COUPON_DATE") or m.get("COUPON")
                 if not coupon_currency:
                     coupon_currency = m.get("FACEUNIT") or m.get("FACEUNIT_S") or m.get("FACEUNIT")
-                    coupon_source = "board-map"
 
         # normalize dates to YYYY-MM-DD or None
         def fmt(date):
@@ -496,8 +490,6 @@ def get_bond_data(isin: str):
             "Купон в валюте": coupon_value or "",
             "Купон в Руб": coupon_value_rub or "",
             "Купон %": coupon_value_prc or "",
-            "Источник купона": coupon_source or "",
-            "Status": "OK" if secname or maturity_date else "Not found",
         }
     except Exception as e:
         return {
@@ -513,8 +505,6 @@ def get_bond_data(isin: str):
             "Купон в валюте": "",
             "Купон в Руб": "",
             "Купон %": "",
-            "Источник купона": "",
-            "Status": f"Error: {str(e)[:120]}",
         }
 
 # ---------------------------
@@ -544,7 +534,7 @@ def fetch_isins_parallel(isins, max_workers=10, show_progress=True):
             isin = future_to_isin[future]
             try:
                 data = future.result()
-            except Exception as e:
+            except Exception:
                 data = {
                     "ISIN": isin,
                     "Код эмитента": "",
@@ -558,8 +548,6 @@ def fetch_isins_parallel(isins, max_workers=10, show_progress=True):
                     "Купон в валюте": "",
                     "Купон в Руб": "",
                     "Купон %": "",
-                    "Источник купона": "",
-                    "Status": f"Error: {str(e)[:120]}",
                 }
             results.append(data)
             completed += 1
@@ -588,7 +576,7 @@ tab1, tab2 = st.tabs(["📁 Загрузить файл", "✍️ Ввести �
 
 with tab1:
     uploaded_file = st.file_uploader("Загрузите Excel или CSV с колонкой ISIN", type=["xlsx", "xls", "csv"])
-    st.write("Пример шаблона (скачайте и заполните колонку ISIN):")
+    st.write("Пример шаблона (скачайте и ��аполните колонку ISIN):")
     sample_csv = "ISIN\nRU000A0JX0J2\nRU000A0ZZZY1\n"
     st.download_button("Скачать шаблон CSV", data=sample_csv, file_name="template_isin.csv", mime="text/csv")
 
@@ -713,10 +701,6 @@ def style_df(row):
 if st.session_state["results"] is not None:
     df_res = st.session_state["results"].copy()
 
-    # ensure Status exists
-    if "Status" not in df_res.columns:
-        df_res["Status"] = "OK"
-
     # merge emitters if available
     if "Код эмитента" in df_res.columns and not df_emitters.empty:
         try:
@@ -736,15 +720,8 @@ if st.session_state["results"] is not None:
         st.warning("⚠️ В данных нет колонки 'Код эмитента' — объединение со справочником пропущено.")
 
     st.markdown(f"**Всего записей:** {len(df_res)}")
-    status_counts = df_res["Status"].value_counts().to_dict()
-    st.write("Статусы:", status_counts)
 
-    # simple status filter
-    statuses = list(df_res["Status"].unique())
-    chosen_statuses = st.multiselect("Фильтр по статусу", options=statuses, default=statuses)
-    df_show = df_res[df_res["Status"].isin(chosen_statuses)]
-
-    st.dataframe(df_show.style.apply(style_df, axis=1), use_container_width=True)
+    st.dataframe(df_res.style.apply(style_df, axis=1), use_container_width=True)
 
     # export
     def to_excel_bytes(df: pd.DataFrame):
@@ -758,19 +735,19 @@ if st.session_state["results"] is not None:
 
     st.download_button(
         label="💾 Скачать результат (Excel)",
-        data=to_excel_bytes(df_show),
+        data=to_excel_bytes(df_res),
         file_name="bond_data.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
     st.download_button(
-        label="💾 Ска��ать результат (CSV)",
-        data=to_csv_bytes(df_show),
+        label="💾 Скачать результат (CSV)",
+        data=to_csv_bytes(df_res),
         file_name="bond_data.csv",
         mime="text/csv",
     )
 
     # rerun all ISINs action
-    if st.button("🔁 Повторно запросить все ISIN"):
+    if st.button("🔁 ��овторно запросить все ISIN"):
         isins_all = df_res["ISIN"].dropna().unique().tolist()
         max_workers = st.sidebar.slider("Параллельных потоков (workers) при повторном запросе", 2, 40, 10)
         with st.spinner("Повторный запрос..."):
