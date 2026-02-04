@@ -696,7 +696,7 @@ def style_df(row):
     return colors
 
 # ---------------------------
-# Show results (table + export)
+# Show results (table + export) with filter for orange-highlighted rows
 # ---------------------------
 if st.session_state["results"] is not None:
     df_res = st.session_state["results"].copy()
@@ -721,7 +721,31 @@ if st.session_state["results"] is not None:
 
     st.markdown(f"**Всего записей:** {len(df_res)}")
 
-    st.dataframe(df_res.style.apply(style_df, axis=1), use_container_width=True)
+    # compute mask for rows that will be highlighted orange (any key date <= danger_threshold)
+    today = datetime.today().date()
+    danger_threshold = today + timedelta(days=days_threshold)
+    key_dates = ["Дата погашения", "Дата оферты Put", "Дата оферты Call", "Дата фиксации купона", "Дата купона"]
+
+    mask_any = pd.Series(False, index=df_res.index)
+    for col in key_dates:
+        if col in df_res.columns:
+            try:
+                s = pd.to_datetime(df_res[col], errors="coerce").dt.date
+                mask_any = mask_any | (s <= danger_threshold)
+            except Exception:
+                # ignore column if can't parse
+                pass
+
+    only_orange = st.checkbox("Показать только бумаги, выделенные оранжевым", value=False)
+    if only_orange:
+        df_show = df_res[mask_any].copy()
+        st.markdown(f"**Показано оранжевых записей:** {len(df_show)}")
+        if df_show.empty:
+            st.info("Нет бумаг, попадающих под критерий (оранжевые).")
+    else:
+        df_show = df_res
+
+    st.dataframe(df_show.style.apply(style_df, axis=1), use_container_width=True)
 
     # export
     def to_excel_bytes(df: pd.DataFrame):
@@ -735,13 +759,13 @@ if st.session_state["results"] is not None:
 
     st.download_button(
         label="💾 Скачать результат (Excel)",
-        data=to_excel_bytes(df_res),
+        data=to_excel_bytes(df_show),
         file_name="bond_data.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
     st.download_button(
         label="💾 Скачать результат (CSV)",
-        data=to_csv_bytes(df_res),
+        data=to_csv_bytes(df_show),
         file_name="bond_data.csv",
         mime="text/csv",
     )
