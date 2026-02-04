@@ -18,7 +18,7 @@ import math
 # Streamlit page setup
 # ---------------------------
 st.set_page_config(page_title="РЕПО претрейд", page_icon="📈", layout="wide")
-st.title("📈 РЕПО претрейд — улучшенная версия")
+st.title("📈 РЕПО претрейд")
 
 # ---------------------------
 # Session state defaults
@@ -576,7 +576,7 @@ tab1, tab2 = st.tabs(["📁 Загрузить файл", "✍️ Ввести �
 
 with tab1:
     uploaded_file = st.file_uploader("Загрузите Excel или CSV с колонкой ISIN", type=["xlsx", "xls", "csv"])
-    st.write("Пример шаблона (скачайте и ��аполните колонку ISIN):")
+    st.write("Пример шаблона (скачайте и заполните колонку ISIN):")
     sample_csv = "ISIN\nRU000A0JX0J2\nRU000A0ZZZY1\n"
     st.download_button("Скачать шаблон CSV", data=sample_csv, file_name="template_isin.csv", mime="text/csv")
 
@@ -746,13 +746,5 @@ if st.session_state["results"] is not None:
         mime="text/csv",
     )
 
-    # rerun all ISINs action
-    if st.button("🔁 ��овторно запросить все ISIN"):
-        isins_all = df_res["ISIN"].dropna().unique().tolist()
-        max_workers = st.sidebar.slider("Параллельных потоков (workers) при повторном запросе", 2, 40, 10)
-        with st.spinner("Повторный запрос..."):
-            new_results = fetch_isins_parallel(isins_all, max_workers=max_workers, show_progress=True)
-        st.session_state["results"] = pd.DataFrame(new_results)
-        st.experimental_rerun()
 else:
     st.info("👆 Загрузите файл или введите ISIN-ы вручную.")
