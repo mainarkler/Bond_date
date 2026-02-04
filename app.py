@@ -145,248 +145,251 @@ def fetch_emitter_and_secid(isin: str):
             root = ET.fromstring(xml_content)
             for node in root.iter():
                 name_attr = (node.attrib.get("name") or "").upper()
-diff --git a/app.py b/app.py
-index 4c880d2aae2bef41c3956186532dd320ea7e6fb6..b484026d2e5bbc48f939b99da7d6482aad22ad22 100644
---- a/app.py
-+++ b/app.py
-@@ -148,111 +148,134 @@ def fetch_emitter_and_secid(isin: str):
-                 val_attr = node.attrib.get("value") or ""
-                 if name_attr == "SECID":
-                     secid = val_attr
-                 elif name_attr == "EMITTER_ID" or name_attr == "EMITTERID":
-                     emitter_id = val_attr
-         except Exception:
-             pass
- 
-     # 3) XML-борды (TQOB/TQCB) — уже загруженные мапы
-     if not secid:
-         m = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
-         if m:
-             secid = m.get("SECID")
-             if not emitter_id:
-                 emitter_id = m.get("EMITTERID")
- 
-     return emitter_id, secid
- 
- # === Функция получения данных по ISIN ===
- @st.cache_data(ttl=3600)
- def get_bond_data(isin):
-     try:
-         emitter_id, secid = fetch_emitter_and_secid(isin)
-         secname = maturity_date = put_date = call_date = None
-         record_date = coupon_date = None
-+        coupon_currency = None
- 
-         # --- Попытка получить информацию по SECID (если есть) ---
-         if secid:
-             try:
-                 url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
-                 r = session.get(url_info, timeout=10)
-                 r.raise_for_status()
-                 data_info = r.json()
-                 rows_info = data_info.get("securities", {}).get("data", [])
-                 cols_info = data_info.get("securities", {}).get("columns", [])
-                 if rows_info and cols_info:
-                     info = dict(zip([c.upper() for c in cols_info], rows_info[0]))
-                     secname = info.get("SECNAME") or info.get("SEC_NAME") or secname
-                     maturity_date = info.get("MATDATE") or maturity_date
-                     put_date = info.get("PUTOPTIONDATE") or put_date
-                     call_date = info.get("CALLOPTIONDATE") or call_date
-             except Exception:
-                 pass
- 
-         # --- Если SECID нет или данные неполные: пытаемся получить инфо по ISIN (fallback) ---
-         if not secname or not maturity_date:
-             try:
-                 url_info_isin = f"https://iss.moex.com/iss/securities/{isin}.json"
-                 r = session.get(url_info_isin, timeout=10)
-                 r.raise_for_status()
-                 data_info_isin = r.json()
-                 rows = data_info_isin.get("securities", {}).get("data", [])
-                 cols = data_info_isin.get("securities", {}).get("columns", [])
-                 if rows and cols:
-                     info = dict(zip([c.upper() for c in cols], rows[0]))
-                     secname = secname or info.get("SECNAME") or info.get("SEC_NAME")
-                     maturity_date = maturity_date or info.get("MATDATE") or info.get("MATDATE")
-                     # также пробуем варианты имён полей
-                     put_date = put_date or info.get("PUTOPTIONDATE") or info.get("PUT_OPTION_DATE")
-                     call_date = call_date or info.get("CALLOPTIONDATE") or info.get("CALL_OPTION_DATE")
-             except Exception:
-                 pass
- 
-         # --- Купоны: ищем ближайший будущий COUPONDATE и RECORDDATE ---
-         # Попробуем сначала statistics/bondization по SECID (если есть), затем по ISIN (fallback)
-         coupons_data = None
-         columns_coupons = []
-+        bondization_currency = None
-         # helper to fetch bondization for either secid or isin
-         def try_fetch_bondization(identifier):
-             try:
-                 # statistics endpoint обычно принимает SECID; но попробуем подставить и ISIN (как fallback)
--                url_coupons = f"https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/bondization/{identifier}.json?iss.only=coupons&iss.meta=off"
-+                url_coupons = (
-+                    "https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/"
-+                    f"bondization/{identifier}.json?iss.only=coupons,bondization&iss.meta=off"
-+                )
-                 r = session.get(url_coupons, timeout=10)
-                 r.raise_for_status()
-                 data = r.json()
-                 coupons = data.get("coupons", {}).get("data", [])
-                 cols = data.get("coupons", {}).get("columns", [])
--                return coupons, cols
-+                bondization_rows = data.get("bondization", {}).get("data", [])
-+                bondization_cols = data.get("bondization", {}).get("columns", [])
-+                faceunit = None
-+                if bondization_rows and bondization_cols:
-+                    bondization_info = dict(zip([c.upper() for c in bondization_cols], bondization_rows[0]))
-+                    faceunit = bondization_info.get("FACEUNIT") or bondization_info.get("FACEUNIT_S")
-+                return coupons, cols, faceunit
-             except Exception:
--                return None, []
-+                return None, [], None
- 
-         if secid:
--            coupons_data, columns_coupons = try_fetch_bondization(secid)
--
--        if (not coupons_data or not columns_coupons) and isin:
--            coupons_data, columns_coupons = try_fetch_bondization(isin)
-+            coupons_data, columns_coupons, bondization_currency = try_fetch_bondization(secid)
-+
-+        if isin:
-+            coupons_data_fallback = columns_coupons_fallback = None
-+            bondization_currency_fallback = None
-+            if not coupons_data or not columns_coupons:
-+                coupons_data_fallback, columns_coupons_fallback, bondization_currency_fallback = (
-+                    try_fetch_bondization(isin)
-+                )
-+                if coupons_data_fallback and columns_coupons_fallback:
-+                    coupons_data = coupons_data_fallback
-+                    columns_coupons = columns_coupons_fallback
-+            if not bondization_currency:
-+                if bondization_currency_fallback is None:
-+                    _, _, bondization_currency_fallback = try_fetch_bondization(isin)
-+                bondization_currency = bondization_currency_fallback or bondization_currency
- 
-         # Если получили купоны — найдём ближайшие будущие даты (robust to different column names)
-         if coupons_data and columns_coupons:
-             df_coupons = pd.DataFrame(coupons_data, columns=columns_coupons)
-             # унифицируем имена колонок
-             cols_upper = [c.upper() for c in df_coupons.columns]
-             df_coupons.columns = cols_upper
- 
-             today = pd.to_datetime(datetime.today().date())
- 
-             # найти колонки потенциально называемые COUPONDATE / COUPON_DATE / COUPON_DATE etc.
-             possible_coupon_cols = [c for c in cols_upper if "COUPON" in c and "DATE" in c]
-             possible_record_cols = [c for c in cols_upper if "RECORD" in c and "DATE" in c]
- 
-             # вспомогательная функция: выбрать минимальную дату > today
-             def next_future_date(series):
-                 try:
-                     s = pd.to_datetime(series, errors="coerce")
-                     s = s[s >= today + pd.Timedelta(days=0)]  # >= today
-                     if not s.empty:
-                         nxt = s.min()
-                         # вернуть строку в формате YYYY-MM-DD
-                         return nxt.strftime("%Y-%m-%d")
-                 except Exception:
-                     pass
-@@ -275,91 +298,95 @@ def get_bond_data(isin):
-                     break
- 
-             # Если не нашли через колонки с именами содержащими COUPON/RECORD — попытаемся искать по типу данных
-             if not coupon_found:
-                 # проверим все колонки на будущие даты и возьмём ближайшую
-                 all_dates = []
-                 for col in df_coupons.columns:
-                     try:
-                         s = pd.to_datetime(df_coupons[col], errors="coerce")
-                         s = s[s >= today]
-                         if not s.empty:
-                             all_dates.append(s.min())
-                     except Exception:
-                         pass
-                 if all_dates:
-                     coupon_found = min(all_dates).strftime("%Y-%m-%d")
- 
-             if not record_found:
-                 # аналогично для record (если нет явной колонки)
-                 # возможно RECORDDATE представлена как DATE + TYPE = RECORD — но мы делаем простую попытку
-                 record_found = None  # уже попытались выше
- 
-             coupon_date = coupon_found
-             record_date = record_found
- 
-+        coupon_currency = bondization_currency or coupon_currency
-+
-         # fallback на XML-борды, если ещё нет дат:
-         if (not record_date or not coupon_date) and (TQOB_MAP or TQCB_MAP):
-             m = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
-             if m:
-                 # поля в мапе могут быть в разной форме; пробуем несколько ключей
-                 if not record_date:
-                     record_date = m.get("RECORDDATE") or m.get("RECORD_DATE") or m.get("RECORD")
-                 if not coupon_date:
-                     coupon_date = m.get("COUPONDATE") or m.get("COUPON_DATE") or m.get("COUPON")
- 
-         # --- Форматирование дат (гарантируем None или YYYY-MM-DD) ---
-         def fmt(date):
-             if pd.isna(date) or not date:
-                 return None
-             try:
-                 return pd.to_datetime(date).strftime("%Y-%m-%d")
-             except Exception:
-                 return None
- 
-         return {
-             "ISIN": isin,
-             "Код эмитента": emitter_id or "",
-             "Наименование инструмента": secname or "",
-             "Дата погашения": fmt(maturity_date),
-             "Дата оферты Put": fmt(put_date),
-             "Дата оферты Call": fmt(call_date),
-             "Дата фиксации купона": fmt(record_date),
-             "Дата купона": fmt(coupon_date),
-+            "Валюта купона": coupon_currency or "",
-         }
- 
-     except Exception as e:
-         st.warning(f"Ошибка при обработке {isin}: {e}")
-         return {
-             "ISIN": isin,
-             "Код эмитента": "",
-             "Наименование инструмента": "",
-             "Дата погашения": None,
-             "Дата оферты Put": None,
-             "Дата оферты Call": None,
-             "Дата фиксации купона": None,
-             "Дата купона": None,
-+            "Валюта купона": "",
-         }
- 
- # === Параллельная обработка ===
- def fetch_isins_parallel(isins):
-     results = []
-     with ThreadPoolExecutor(max_workers=10) as executor:
-         future_to_isin = {executor.submit(get_bond_data, isin): isin for isin in isins}
-         for future in as_completed(future_to_isin):
-             data = future.result()
-             if data:
-                 results.append(data)
-     return results
- 
- # === Интерфейс ввода ===
- st.subheader("📤 Загрузка или ввод ISIN")
- tab1, tab2 = st.tabs(["📁 Загрузить файл", "✍️ Ввести вручную"])
- 
- with tab1:
-     uploaded_file = st.file_uploader("Загрузите Excel или CSV с колонкой ISIN", type=["xlsx", "xls", "csv"])
- 
- with tab2:
-     isin_input = st.text_area("Введите или вставьте ISIN (через Ctrl+V, пробел или запятую)", height=150)
-     if st.button("🔍 Получить данные по введённым ISIN"):
-         raw_text = isin_input.strip()
-         if raw_text:
+                val_attr = node.attrib.get("value") or ""
+                if name_attr == "SECID":
+                    secid = val_attr
+                elif name_attr == "EMITTER_ID" or name_attr == "EMITTERID":
+                    emitter_id = val_attr
+        except Exception:
+            pass
+
+    # 3) XML-борды (TQOB/TQCB) — уже загруженные мапы
+    if not secid:
+        m = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
+        if m:
+            secid = m.get("SECID")
+            if not emitter_id:
+                emitter_id = m.get("EMITTERID")
+
+    return emitter_id, secid
+
+# === Функция получения данных по ISIN ===
+@st.cache_data(ttl=3600)
+def get_bond_data(isin):
+    try:
+        emitter_id, secid = fetch_emitter_and_secid(isin)
+        secname = maturity_date = put_date = call_date = None
+        record_date = coupon_date = None
+        coupon_currency = None
+
+        # --- Попытка получить информацию по SECID (если есть) ---
+        if secid:
+            try:
+                url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
+                r = session.get(url_info, timeout=10)
+                r.raise_for_status()
+                data_info = r.json()
+                rows_info = data_info.get("securities", {}).get("data", [])
+                cols_info = data_info.get("securities", {}).get("columns", [])
+                if rows_info and cols_info:
+                    info = dict(zip([c.upper() for c in cols_info], rows_info[0]))
+                    secname = info.get("SECNAME") or info.get("SEC_NAME") or secname
+                    maturity_date = info.get("MATDATE") or maturity_date
+                    put_date = info.get("PUTOPTIONDATE") or put_date
+                    call_date = info.get("CALLOPTIONDATE") or call_date
+            except Exception:
+                pass
+
+        # --- Если SECID нет или данные неполные: пытаемся получить инфо по ISIN (fallback) ---
+        if not secname or not maturity_date:
+            try:
+                url_info_isin = f"https://iss.moex.com/iss/securities/{isin}.json"
+                r = session.get(url_info_isin, timeout=10)
+                r.raise_for_status()
+                data_info_isin = r.json()
+                rows = data_info_isin.get("securities", {}).get("data", [])
+                cols = data_info_isin.get("securities", {}).get("columns", [])
+                if rows and cols:
+                    info = dict(zip([c.upper() for c in cols], rows[0]))
+                    secname = secname or info.get("SECNAME") or info.get("SEC_NAME")
+                    maturity_date = maturity_date or info.get("MATDATE") or info.get("MATDATE")
+                    # также пробуем варианты имён полей
+                    put_date = put_date or info.get("PUTOPTIONDATE") or info.get("PUT_OPTION_DATE")
+                    call_date = call_date or info.get("CALLOPTIONDATE") or info.get("CALL_OPTION_DATE")
+            except Exception:
+                pass
+
+        # --- Купоны: ищем ближайший будущий COUPONDATE и RECORDDATE ---
+        # Попробуем сначала statistics/bondization по SECID (если есть), затем по ISIN (fallback)
+        coupons_data = None
+        columns_coupons = []
+        bondization_currency = None
+        # helper to fetch bondization for either secid or isin
+        def try_fetch_bondization(identifier):
+            try:
+                # statistics endpoint обычно принимает SECID; но попробуем подставить и ISIN (как fallback)
+                url_coupons = (
+                    "https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/"
+                    f"bondization/{identifier}.json?iss.only=coupons,bondization&iss.meta=off"
+                )
+                r = session.get(url_coupons, timeout=10)
+                r.raise_for_status()
+                data = r.json()
+                coupons = data.get("coupons", {}).get("data", [])
+                cols = data.get("coupons", {}).get("columns", [])
+                bondization_rows = data.get("bondization", {}).get("data", [])
+                bondization_cols = data.get("bondization", {}).get("columns", [])
+                faceunit = None
+                if bondization_rows and bondization_cols:
+                    bondization_info = dict(zip([c.upper() for c in bondization_cols], bondization_rows[0]))
+                    faceunit = bondization_info.get("FACEUNIT") or bondization_info.get("FACEUNIT_S")
+                return coupons, cols, faceunit
+            except Exception:
+                return None, [], None
+
+        if secid:
+            coupons_data, columns_coupons, bondization_currency = try_fetch_bondization(secid)
+
+        if isin:
+            coupons_data_fallback = columns_coupons_fallback = None
+            bondization_currency_fallback = None
+            if not coupons_data or not columns_coupons:
+                coupons_data_fallback, columns_coupons_fallback, bondization_currency_fallback = (
+                    try_fetch_bondization(isin)
+                )
+                if coupons_data_fallback and columns_coupons_fallback:
+                    coupons_data = coupons_data_fallback
+                    columns_coupons = columns_coupons_fallback
+            if not bondization_currency:
+                if bondization_currency_fallback is None:
+                    _, _, bondization_currency_fallback = try_fetch_bondization(isin)
+                bondization_currency = bondization_currency_fallback or bondization_currency
+
+        # Если получили купоны — найдём ближайшие будущие даты (robust to different column names)
+        if coupons_data and columns_coupons:
+            df_coupons = pd.DataFrame(coupons_data, columns=columns_coupons)
+            # унифицируем имена колонок
+            cols_upper = [c.upper() for c in df_coupons.columns]
+            df_coupons.columns = cols_upper
+
+            today = pd.to_datetime(datetime.today().date())
+
+            # найти колонки потенциально называемые COUPONDATE / COUPON_DATE / COUPON_DATE etc.
+            possible_coupon_cols = [c for c in cols_upper if "COUPON" in c and "DATE" in c]
+            possible_record_cols = [c for c in cols_upper if "RECORD" in c and "DATE" in c]
+
+            # вспомогательная функция: выбрать минимальную дату > today
+            def next_future_date(series):
+                try:
+                    s = pd.to_datetime(series, errors="coerce")
+                    s = s[s >= today + pd.Timedelta(days=0)]  # >= today
+                    if not s.empty:
+                        nxt = s.min()
+                        # вернуть строку в формате YYYY-MM-DD
+                        return nxt.strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+                return None
+
+            # Найдём ближайший купон
+            coupon_found = None
+            for col in possible_coupon_cols:
+                candidate = next_future_date(df_coupons[col])
+                if candidate:
+                    coupon_found = candidate
+                    break
+
+            # Найдём ближайшую дату фиксации купона (record date)
+            record_found = None
+            for col in possible_record_cols:
+                candidate = next_future_date(df_coupons[col])
+                if candidate:
+                    record_found = candidate
+                    break
+
+            # Если не нашли через колонки с именами содержащими COUPON/RECORD — попытаемся искать по типу данных
+            if not coupon_found:
+                # проверим все колонки на будущие даты и возьмём ближайшую
+                all_dates = []
+                for col in df_coupons.columns:
+                    try:
+                        s = pd.to_datetime(df_coupons[col], errors="coerce")
+                        s = s[s >= today]
+                        if not s.empty:
+                            all_dates.append(s.min())
+                    except Exception:
+                        pass
+                if all_dates:
+                    coupon_found = min(all_dates).strftime("%Y-%m-%d")
+
+            if not record_found:
+                # аналогично для record (если нет явной колонки)
+                # возможно RECORDDATE представлена как DATE + TYPE = RECORD — но мы делаем простую попытку
+                record_found = None  # уже попытались выше
+
+            coupon_date = coupon_found
+            record_date = record_found
+
+        coupon_currency = bondization_currency or coupon_currency
+
+        # fallback на XML-борды, если ещё нет дат:
+        if (not record_date or not coupon_date) and (TQOB_MAP or TQCB_MAP):
+            m = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
+            if m:
+                # поля в мапе могут быть в разной форме; пробуем несколько ключей
+                if not record_date:
+                    record_date = m.get("RECORDDATE") or m.get("RECORD_DATE") or m.get("RECORD")
+                if not coupon_date:
+                    coupon_date = m.get("COUPONDATE") or m.get("COUPON_DATE") or m.get("COUPON")
+
+        # --- Форматирование дат (гарантируем None или YYYY-MM-DD) ---
+        def fmt(date):
+            if pd.isna(date) or not date:
+                return None
+            try:
+                return pd.to_datetime(date).strftime("%Y-%m-%d")
+            except Exception:
+                return None
+
+        return {
+            "ISIN": isin,
+            "Код эмитента": emitter_id or "",
+            "Наименование инструмента": secname or "",
+            "Дата погашения": fmt(maturity_date),
+            "Дата оферты Put": fmt(put_date),
+            "Дата оферты Call": fmt(call_date),
+            "Дата фиксации купона": fmt(record_date),
+            "Дата купона": fmt(coupon_date),
+            "Валюта купона": coupon_currency or "",
+        }
+
+    except Exception as e:
+        st.warning(f"Ошибка при обработке {isin}: {e}")
+        return {
+            "ISIN": isin,
+            "Код эмитента": "",
+            "Наименование инструмента": "",
+            "Дата погашения": None,
+            "Дата оферты Put": None,
+            "Дата оферты Call": None,
+            "Дата фиксации купона": None,
+            "Дата купона": None,
+            "Валюта купона": "",
+        }
+
+# === Параллельная обработка ===
+def fetch_isins_parallel(isins):
+    results = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_isin = {executor.submit(get_bond_data, isin): isin for isin in isins}
+        for future in as_completed(future_to_isin):
+            data = future.result()
+            if data:
+                results.append(data)
+    return results
+
+# === Интерфейс ввода ===
+st.subheader("📤 Загрузка или ввод ISIN")
+tab1, tab2 = st.tabs(["📁 Загрузить файл", "✍️ Ввести вручную"])
+
+with tab1:
+    uploaded_file = st.file_uploader("Загрузите Excel или CSV с колонкой ISIN", type=["xlsx", "xls", "csv"])
+
+with tab2:
+    isin_input = st.text_area("Введите или вставьте ISIN (через Ctrl+V, пробел или запятую)", height=150)
+    if st.button("🔍 Получить данные по введённым ISIN"):
+        raw_text = isin_input.strip()
+        if raw_text:
             isins = re.split(r"[\s,;]+", raw_text)
             isins = [i.strip().upper() for i in isins if i.strip()]
             results = fetch_isins_parallel(isins)
