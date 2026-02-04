@@ -736,12 +736,12 @@ if st.session_state["results"] is not None:
                 # ignore column if can't parse
                 pass
 
-    only_orange = st.checkbox("Показать только бумаги, выделенные оранжевым", value=False)
+    only_orange = st.checkbox("Показать бумаги с отсечкой в периоде", value=False)
     if only_orange:
         df_show = df_res[mask_any].copy()
-        st.markdown(f"**Показано оранжевых записей:** {len(df_show)}")
+        st.markdown(f"**Показано записей с отсечкой:** {len(df_show)}")
         if df_show.empty:
-            st.info("Нет бумаг, попадающих под критерий (оранжевые).")
+            st.info("Нет бумаг, попадающих под критерий (отсечки).")
     else:
         df_show = df_res
 
