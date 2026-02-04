@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 import requests
@@ -11,12 +12,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import time
+import math
 
-# === Настройки страницы ===
+# ---------------------------
+# Streamlit page setup
+# ---------------------------
 st.set_page_config(page_title="РЕПО претрейд", page_icon="📈", layout="wide")
 st.title("📈 РЕПО претрейд — улучшенная версия")
 
-# === Session state ===
+# ---------------------------
+# Session state defaults
+# ---------------------------
 if "results" not in st.session_state:
     st.session_state["results"] = None
 if "file_loaded" not in st.session_state:
@@ -24,7 +30,9 @@ if "file_loaded" not in st.session_state:
 if "last_file_name" not in st.session_state:
     st.session_state["last_file_name"] = None
 
-# === Настройки длительности РЕПО ===
+# ---------------------------
+# REPO duration settings
+# ---------------------------
 st.subheader("⚙️ Настройки длительности РЕПО")
 if "overnight" not in st.session_state:
     st.session_state["overnight"] = False
@@ -37,7 +45,7 @@ if st.button("🔄 Очистить форму"):
     st.session_state["results"] = None
     st.session_state["file_loaded"] = False
     st.session_state["last_file_name"] = None
-    st.rerun()
+    st.experimental_rerun()
 
 overnight = st.checkbox("Overnight РЕПО", key="overnight")
 extra_days_input = st.number_input(
@@ -49,33 +57,40 @@ extra_days_input = st.number_input(
     key="extra_days",
 )
 if st.session_state["overnight"]:
-    st.markdown("<span style='color:gray'>Дополнительные дни отключены при включенном Overnight</span>", unsafe_allow_html=True)
+    st.markdown(
+        "<span style='color:gray'>Дополнительные дни отключены при включенном Overnight</span>",
+        unsafe_allow_html=True,
+    )
 days_threshold = 2 if st.session_state["overnight"] else 1 + st.session_state["extra_days"]
 st.write(f"Текущее значение границы выплат: {days_threshold} дн.")
 
-# === Connection: session with retries ===
+# ---------------------------
+# HTTP session with retries
+# ---------------------------
 session = requests.Session()
-# sensible retry strategy to handle 429/5xx transient errors
-retries = Retry(total=5, backoff_factor=0.8, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET", "POST"])
-adapter = HTTPAdapter(max_retries=retries)
+retry_strategy = Retry(
+    total=5,
+    backoff_factor=0.8,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "POST"],
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
 session.headers.update({"User-Agent": "python-requests/iss-moex-script"})
 
-def request_get(url, timeout=15):
-    """Wrapper to centralize GET requests and handle exceptions uniformly."""
-    try:
-        r = session.get(url, timeout=timeout)
-        r.raise_for_status()
-        return r
-    except Exception as e:
-        # bubble up the exception to caller to handle logging/status
-        raise
+def request_get(url: str, timeout: int = 15):
+    """Centralized GET with session + raise for status."""
+    r = session.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r
 
-# === Безопасное чтение CSV/Excel из строки/BytesIO ===
-def safe_read_csv_string(content: str):
-    content = content.replace('\r\n', '\n').strip()
-    sample = content[:4096]
+# ---------------------------
+# Safe CSV/Excel reading helpers
+# ---------------------------
+def safe_read_csv_string(content: str) -> pd.DataFrame:
+    content = content.replace("\r\n", "\n").strip()
+    sample = content[:8192]
     try:
         dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t"])
         sep = dialect.delimiter
@@ -85,24 +100,60 @@ def safe_read_csv_string(content: str):
         df = pd.read_csv(StringIO(content), sep=sep, dtype=str)
         df.columns = [c.strip().upper() for c in df.columns]
         return df
-    except Exception as e:
-        st.warning(f"⚠️ Ошибка при парсинге CSV: {e}")
+    except Exception:
         return pd.DataFrame()
 
-def safe_read_filelike(uploaded_file):
+def safe_read_filelike(uploaded_file) -> pd.DataFrame:
     name = uploaded_file.name
     try:
         if name.lower().endswith(".csv"):
             raw = uploaded_file.getvalue().decode("utf-8-sig")
             return safe_read_csv_string(raw)
         else:
-            # Excel or other supported by pandas
+            # For Excel and others let pandas try
             return pd.read_excel(uploaded_file, dtype=str)
-    except Exception as e:
-        st.warning(f"⚠️ Ошибка при чтении загруженного файла {name}: {e}")
+    except Exception:
         return pd.DataFrame()
 
-# === Кэширование XML TQOB и TQCB ===
+# ---------------------------
+# ISIN validation (format + checksum)
+# ---------------------------
+def isin_format_valid(isin: str) -> bool:
+    """Basic regex check for ISIN structure."""
+    if not isin or not isinstance(isin, str):
+        return False
+    return bool(re.match(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$", isin.strip().upper()))
+
+def isin_checksum_valid(isin: str) -> bool:
+    """ISIN checksum (Luhn-like). Returns True for valid ISINs."""
+    if not isin_format_valid(isin):
+        return False
+    s = isin.strip().upper()
+    # Replace letters with numbers: A=10, B=11, ..., Z=35
+    converted = ""
+    for ch in s[:-1]:  # checksum digit excluded at end
+        if ch.isdigit():
+            converted += ch
+        else:
+            converted += str(ord(ch) - 55)
+    # Now apply Luhn algorithm on converted + check digit
+    digits = converted + s[-1]
+    # Repeat digits into list of ints
+    arr = [int(x) for x in digits]
+    # Starting from right, double every second digit
+    total = 0
+    parity = len(arr) % 2
+    for i, d in enumerate(arr):
+        if i % 2 == parity:
+            d = d * 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+# ---------------------------
+# Load TQOB/TQCB board XML caches (for fallback)
+# ---------------------------
 @st.cache_data(ttl=3600)
 def fetch_board_xml(board: str):
     url = f"https://iss.moex.com/iss/engines/stock/markets/bonds/boards/{board.lower()}/securities.xml?marketprice_board=3&iss.meta=off"
@@ -121,14 +172,15 @@ def fetch_board_xml(board: str):
                 if isin:
                     mapping[isin] = {"SECID": secid or None, "EMITTERID": emitterid or None, **attrs}
         return mapping
-    except Exception as e:
-        st.warning(f"⚠️ Не удалось загрузить {board}: {e}")
+    except Exception:
         return {}
 
 TQOB_MAP = fetch_board_xml("tqob")
 TQCB_MAP = fetch_board_xml("tqcb")
 
-# === Функция поиска эмитента и SECID ===
+# ---------------------------
+# Fetch emitter & secid (with caching)
+# ---------------------------
 @st.cache_data(ttl=3600)
 def fetch_emitter_and_secid(isin: str):
     isin = str(isin).strip().upper()
@@ -137,7 +189,7 @@ def fetch_emitter_and_secid(isin: str):
     emitter_id = None
     secid = None
 
-    # 1) JSON по ISIN (часто отрабатывает)
+    # 1) try JSON securities/{isin}.json
     try:
         url = f"https://iss.moex.com/iss/securities/{isin}.json"
         r = request_get(url, timeout=10)
@@ -145,19 +197,19 @@ def fetch_emitter_and_secid(isin: str):
         securities = data.get("securities", {})
         cols = securities.get("columns", [])
         rows = securities.get("data", [])
-        if rows:
+        if rows and cols:
             first = rows[0]
             col_map = {c.upper(): i for i, c in enumerate(cols)}
             if "EMITTER_ID" in col_map:
-                emitter_id = first[col_map.get("EMITTER_ID")]
+                emitter_id = first[col_map["EMITTER_ID"]]
             elif "EMITTERID" in col_map:
-                emitter_id = first[col_map.get("EMITTERID")]
+                emitter_id = first[col_map["EMITTERID"]]
             if "SECID" in col_map:
-                secid = first[col_map.get("SECID")]
+                secid = first[col_map["SECID"]]
     except Exception:
         pass
 
-    # 2) XML по ISIN (fallback)
+    # 2) fallback: XML securities/{isin}.xml
     if not secid:
         try:
             url = f"https://iss.moex.com/iss/securities/{isin}.xml?iss.meta=off"
@@ -170,12 +222,12 @@ def fetch_emitter_and_secid(isin: str):
                 val_attr = node.attrib.get("value") or ""
                 if name_attr == "SECID":
                     secid = val_attr
-                elif name_attr == "EMITTER_ID" or name_attr == "EMITTERID":
+                elif name_attr in ("EMITTER_ID", "EMITTERID"):
                     emitter_id = val_attr
         except Exception:
             pass
 
-    # 3) XML-борды (TQOB/TQCB) — уже загруженные мапы
+    # 3) try XML board maps
     if not secid:
         m = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
         if m:
@@ -185,9 +237,11 @@ def fetch_emitter_and_secid(isin: str):
 
     return emitter_id, secid
 
-# === Функция получения данных по ISIN ===
+# ---------------------------
+# Core: get bond data per ISIN
+# ---------------------------
 @st.cache_data(ttl=3600)
-def get_bond_data(isin):
+def get_bond_data(isin: str):
     isin = str(isin).strip().upper()
     try:
         emitter_id, secid = fetch_emitter_and_secid(isin)
@@ -197,8 +251,9 @@ def get_bond_data(isin):
         coupon_value = None
         coupon_value_rub = None
         coupon_value_prc = None
+        coupon_source = None  # where currency/values came from
 
-        # --- Попытка получить информацию по SECID (если есть) ---
+        # --- info by SECID if present ---
         if secid:
             try:
                 url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
@@ -215,7 +270,7 @@ def get_bond_data(isin):
             except Exception:
                 pass
 
-        # --- Если SECID нет или данные неполные: пытаемся получить инфо по ISIN (fallback) ---
+        # --- fallback to securities/{isin}.json ---
         if not secname or not maturity_date:
             try:
                 url_info_isin = f"https://iss.moex.com/iss/securities/{isin}.json"
@@ -232,12 +287,12 @@ def get_bond_data(isin):
             except Exception:
                 pass
 
-        # --- Купоны: ищем ближайший будущий COUPONDATE и RECORDDATE + валюту и значения купона ---
+        # --- bondization coupons: currency and coupon values ---
         coupons_data = None
         columns_coupons = []
-        bondization_currency = None
+        bondization_faceunit = None
 
-        def try_fetch_bondization(identifier):
+        def try_fetch_bondization(identifier: str):
             try:
                 url_coupons = (
                     "https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/"
@@ -247,69 +302,56 @@ def get_bond_data(isin):
                 data = r.json()
                 coupons = data.get("coupons", {}).get("data", [])
                 cols = data.get("coupons", {}).get("columns", [])
-                bondization_rows = data.get("bondization", {}).get("data", [])
-                bondization_cols = data.get("bondization", {}).get("columns", [])
+                bond_rows = data.get("bondization", {}).get("data", [])
+                bond_cols = data.get("bondization", {}).get("columns", [])
                 faceunit = None
-                if bondization_rows and bondization_cols:
-                    bondization_info = dict(zip([c.upper() for c in bondization_cols], bondization_rows[0]))
-                    faceunit = bondization_info.get("FACEUNIT") or bondization_info.get("FACEUNIT_S")
+                if bond_rows and bond_cols:
+                    bond_info = dict(zip([c.upper() for c in bond_cols], bond_rows[0]))
+                    faceunit = bond_info.get("FACEUNIT") or bond_info.get("FACEUNIT_S")
                 return coupons, cols, faceunit
             except Exception:
                 return None, [], None
 
         if secid:
-            coupons_data, columns_coupons, bondization_currency = try_fetch_bondization(secid)
+            coupons_data, columns_coupons, bondization_faceunit = try_fetch_bondization(secid)
 
-        if isin:
-            coupons_data_fallback = columns_coupons_fallback = None
-            bondization_currency_fallback = None
-            if not coupons_data or not columns_coupons:
-                coupons_data_fallback, columns_coupons_fallback, bondization_currency_fallback = try_fetch_bondization(isin)
-                if coupons_data_fallback and columns_coupons_fallback:
-                    coupons_data = coupons_data_fallback
-                    columns_coupons = columns_coupons_fallback
-            if not bondization_currency:
-                if bondization_currency_fallback is None:
-                    _, _, bondization_currency_fallback = try_fetch_bondization(isin)
-                bondization_currency = bondization_currency_fallback or bondization_currency
+        if isin and (not coupons_data or not columns_coupons):
+            coupons_data_fallback, columns_coupons_fallback, bondization_faceunit_fallback = try_fetch_bondization(isin)
+            if coupons_data_fallback and columns_coupons_fallback:
+                coupons_data = coupons_data_fallback
+                columns_coupons = columns_coupons_fallback
+            if not bondization_faceunit:
+                bondization_faceunit = bondization_faceunit_fallback or bondization_faceunit
 
-        # Если получили купоны — найдём ближайшие будущие даты (robust to different column names)
+        # parse coupons table if present
         if coupons_data and columns_coupons:
             df_coupons = pd.DataFrame(coupons_data, columns=columns_coupons)
             cols_upper = [c.upper() for c in df_coupons.columns]
             df_coupons.columns = cols_upper
-
             today = pd.to_datetime(datetime.today().date())
-
-            possible_coupon_cols = [c for c in cols_upper if "COUPON" in c and "DATE" in c]
-            possible_record_cols = [c for c in cols_upper if "RECORD" in c and "DATE" in c]
-
+            # possible columns for coupon date / record date
+            possible_coupon_date_cols = [c for c in cols_upper if "COUPON" in c and "DATE" in c]
+            possible_record_date_cols = [c for c in cols_upper if "RECORD" in c and "DATE" in c]
+            # helper to pick next future date
             def next_future_date(series):
                 try:
                     s = pd.to_datetime(series, errors="coerce")
-                    s = s[s >= today + pd.Timedelta(days=0)]
+                    s = s[s >= today]
                     if not s.empty:
-                        nxt = s.min()
-                        return nxt.strftime("%Y-%m-%d")
+                        return s.min().strftime("%Y-%m-%d")
                 except Exception:
                     pass
                 return None
 
+            # find nearest coupon date
             coupon_found = None
-            for col in possible_coupon_cols:
+            for col in possible_coupon_date_cols:
                 candidate = next_future_date(df_coupons[col])
                 if candidate:
                     coupon_found = candidate
                     break
-
-            record_found = None
-            for col in possible_record_cols:
-                candidate = next_future_date(df_coupons[col])
-                if candidate:
-                    record_found = candidate
-                    break
-
             if not coupon_found:
+                # search any date-like column
                 all_dates = []
                 for col in df_coupons.columns:
                     try:
@@ -321,63 +363,66 @@ def get_bond_data(isin):
                         pass
                 if all_dates:
                     coupon_found = min(all_dates).strftime("%Y-%m-%d")
-
             coupon_date = coupon_found
+
+            # record date
+            record_found = None
+            for col in possible_record_date_cols:
+                candidate = next_future_date(df_coupons[col])
+                if candidate:
+                    record_found = candidate
+                    break
             record_date = record_found
 
-            # --- Попытка извлечь валюту купона и значения купона из таблицы coupons ---
-            # faceunit может быть в bondization_currency или в колонке FACEUNIT в coupons
-            if not bondization_currency:
-                # попробуем найти колонку FACEUNIT (в разных вариантах имен)
+            # determine faceunit currency (currency of coupon)
+            if bondization_faceunit:
+                coupon_currency = bondization_faceunit
+                coupon_source = "bondization(faceunit)"
+            else:
+                # try to find FACEUNIT column in coupons
                 faceunit_cols = [c for c in df_coupons.columns if "FACEUNIT" in c or c == "FACEUNIT_S"]
                 if faceunit_cols:
-                    # берем первый ненулевой
                     for c in faceunit_cols:
                         vals = df_coupons[c].dropna().astype(str)
                         if not vals.empty and vals.iloc[0].strip():
-                            bondization_currency = vals.iloc[0].strip()
+                            coupon_currency = vals.iloc[0].strip()
+                            coupon_source = f"coupons::{c}"
                             break
 
-            coupon_currency = bondization_currency or coupon_currency
-
-            # значения купонов: ищем VALUE / VALUE_RUB / VALUEPRC (или похожие)
+            # find value columns
             val_col = None
             val_rub_col = None
             val_prc_col = None
             for c in df_coupons.columns:
                 uc = c.upper()
-                if uc in ("VALUE", "COUPONVALUE", "VALUE_COUPON") and not val_col:
+                if uc in ("VALUE", "VALUE_COUPON", "COUPONVALUE") and not val_col:
                     val_col = c
-                if uc in ("VALUE_RUB", "VALUE_RUBS", "VALUE_RUB_L", "VALUE_RUBS") and not val_rub_col:
+                if "VALUE_RUB" in uc and not val_rub_col:
                     val_rub_col = c
-                if uc in ("VALUEPRC", "VALUE_PRC", "VALUEPRC_") and not val_prc_col:
+                if uc in ("VALUEPRC", "VALUE_PRC", "VALUE%") and not val_prc_col:
                     val_prc_col = c
-            # fallback: try to find numeric columns named value / value_rub / valueprc by regex
-            import math
+            # regex fallbacks
             if not val_col:
                 for c in df_coupons.columns:
-                    if re.match(r'VALUE($|_)', c, flags=re.IGNORECASE):
+                    if re.match(r"^VALUE$", c, flags=re.IGNORECASE):
                         val_col = c
                         break
             if not val_rub_col:
                 for c in df_coupons.columns:
-                    if re.match(r'VALUE.*RUB', c, flags=re.IGNORECASE):
-                        val_rub_col = c
-                        break
+                    if re.search(r"RUB", c, flags=re.IGNORECASE):
+                        if "VALUE" in c.upper() or "RUB" in c.upper():
+                            val_rub_col = c
+                            break
             if not val_prc_col:
                 for c in df_coupons.columns:
-                    if re.search(r'PRC|PERC|%|PERCENT', c, flags=re.IGNORECASE):
-                        # avoid columns like PRIMARY_BOARDID etc.
-                        if "VALUE" in c or "PRC" in c or "PERC" in c:
-                            val_prc_col = c
-                            break
+                    if re.search(r"PRC|PERC|%|PERCENT", c, flags=re.IGNORECASE):
+                        val_prc_col = c
+                        break
 
-            # выберем ближайший купон (строку) — ту же дату coupon_date, чтобы брать значения именно для ближайшего купона
+            # pick the row corresponding to the chosen coupon_date if possible
             chosen_row = None
             if coupon_date:
-                # ищем строку с этой coupon_date
-                candidate_cols = [c for c in df_coupons.columns if "COUPON" in c and "DATE" in c]
-                for c in candidate_cols:
+                for c in possible_coupon_date_cols:
                     try:
                         mask = pd.to_datetime(df_coupons[c], errors="coerce").dt.strftime("%Y-%m-%d") == coupon_date
                         rows = df_coupons[mask]
@@ -387,43 +432,37 @@ def get_bond_data(isin):
                     except Exception:
                         pass
             if chosen_row is None:
-                # fallback — возьмём первую строку с ненулевыми VALUE/VALUE_RUB/VALUEPRC по порядку
+                # fallback: first row that has any value in value columns and (optionally) date in future
                 for idx in range(len(df_coupons)):
                     row = df_coupons.iloc[idx]
-                    # prefer rows with date in future
-                    try:
-                        # pick first where at least one of value columns non-null
-                        ok = False
-                        for colcheck in [val_col, val_rub_col, val_prc_col]:
+                    has_val = False
+                    for colcheck in (val_col, val_rub_col, val_prc_col):
+                        try:
                             if colcheck and pd.notnull(row.get(colcheck)):
-                                ok = True
+                                has_val = True
                                 break
-                        if ok:
-                            chosen_row = row
-                            break
-                    except Exception:
-                        pass
+                        except Exception:
+                            pass
+                    if has_val:
+                        chosen_row = row
+                        break
 
-            # извлечение значений из выбранной строки
-            def get_row_value(row, col):
-                if row is None or col is None:
+            def norm_str(v):
+                if v is None or (isinstance(v, float) and math.isnan(v)):
                     return None
                 try:
-                    v = row.get(col)
-                    if pd.isna(v) or v == "":
-                        return None
-                    # привести к строке как есть, для чисел оставить точку
                     return str(v)
                 except Exception:
                     return None
 
-            coupon_value = get_row_value(chosen_row, val_col)
-            coupon_value_rub = get_row_value(chosen_row, val_rub_col)
-            coupon_value_prc = get_row_value(chosen_row, val_prc_col)
+            if chosen_row is not None:
+                coupon_value = norm_str(chosen_row.get(val_col)) if val_col else None
+                coupon_value_rub = norm_str(chosen_row.get(val_rub_col)) if val_rub_col else None
+                coupon_value_prc = norm_str(chosen_row.get(val_prc_col)) if val_prc_col else None
+                if coupon_source is None:
+                    coupon_source = "coupons(row)"
 
-        coupon_currency = coupon_currency or bondization_currency
-
-        # fallback на XML-борды, если ещё нет дат или валюты:
+        # fallback to board maps for dates/currency
         if (not record_date or not coupon_date or not coupon_currency) and (TQOB_MAP or TQCB_MAP):
             m = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
             if m:
@@ -433,8 +472,9 @@ def get_bond_data(isin):
                     coupon_date = m.get("COUPONDATE") or m.get("COUPON_DATE") or m.get("COUPON")
                 if not coupon_currency:
                     coupon_currency = m.get("FACEUNIT") or m.get("FACEUNIT_S") or m.get("FACEUNIT")
+                    coupon_source = "board-map"
 
-        # --- Форматирование дат (гарантируем None или YYYY-MM-DD) ---
+        # normalize dates to YYYY-MM-DD or None
         def fmt(date):
             if pd.isna(date) or not date:
                 return None
@@ -456,10 +496,9 @@ def get_bond_data(isin):
             "Купон в валюте": coupon_value or "",
             "Купон в Руб": coupon_value_rub or "",
             "Купон %": coupon_value_prc or "",
-            "Валюта купона (raw)": bondization_currency or "",
+            "Источник купона": coupon_source or "",
             "Status": "OK" if secname or maturity_date else "Not found",
         }
-
     except Exception as e:
         return {
             "ISIN": isin,
@@ -474,12 +513,14 @@ def get_bond_data(isin):
             "Купон в валюте": "",
             "Купон в Руб": "",
             "Купон %": "",
-            "Валюта купона (raw)": "",
+            "Источник купона": "",
             "Status": f"Error: {str(e)[:120]}",
         }
 
-# === Параллельная обработка с прогрессом и возможностью настройки workers ===
-def fetch_isins_parallel(isins, max_workers=10, progress_key=None):
+# ---------------------------
+# Parallel fetch with safe progress updates
+# ---------------------------
+def fetch_isins_parallel(isins, max_workers=10, show_progress=True):
     results = []
     total = len(isins)
     if total == 0:
@@ -487,9 +528,14 @@ def fetch_isins_parallel(isins, max_workers=10, progress_key=None):
 
     progress_bar = None
     progress_text = None
-    if progress_key:
-        progress_bar = st.progress(0, key=f"{progress_key}_bar")
-        progress_text = st.empty()
+    if show_progress:
+        # Do not pass keys to progress to avoid widget conflicts in some envs.
+        try:
+            progress_bar = st.progress(0)
+            progress_text = st.empty()
+        except Exception:
+            progress_bar = None
+            progress_text = None
 
     completed = 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -512,21 +558,31 @@ def fetch_isins_parallel(isins, max_workers=10, progress_key=None):
                     "Купон в валюте": "",
                     "Купон в Руб": "",
                     "Купон %": "",
-                    "Валюта купона (raw)": "",
+                    "Источник купона": "",
                     "Status": f"Error: {str(e)[:120]}",
                 }
             results.append(data)
             completed += 1
             if progress_bar:
-                progress_bar.progress(completed / total)
+                try:
+                    progress_bar.progress(completed / total)
+                except Exception:
+                    pass
             if progress_text:
-                progress_text.text(f"Обработано {completed}/{total} ISIN")
-    if progress_key:
-        # small pause so user sees 100%
-        time.sleep(0.2)
+                try:
+                    progress_text.text(f"Обработано {completed}/{total} ISIN")
+                except Exception:
+                    pass
+    # small pause so user sees 100%
+    try:
+        time.sleep(0.12)
+    except Exception:
+        pass
     return results
 
-# === Интерфейс ввода ===
+# ---------------------------
+# UI: input tabs
+# ---------------------------
 st.subheader("📤 Загрузка или ввод ISIN")
 tab1, tab2 = st.tabs(["📁 Загрузить файл", "✍️ Ввести вручную"])
 
@@ -543,29 +599,50 @@ with tab2:
         if raw_text:
             isins = re.split(r"[\s,;]+", raw_text)
             isins = [i.strip().upper() for i in isins if i.strip()]
-            # validate basic ISIN shape
-            isin_pattern = re.compile(r'^[A-Z]{2}[A-Z0-9]{9}[0-9]$')
-            invalid = [i for i in isins if not isin_pattern.match(i)]
-            if invalid:
-                st.warning(f"Некорректные ISIN пропущены: {', '.join(invalid[:10])}{'...' if len(invalid)>10 else ''}")
-                isins = [i for i in isins if isin_pattern.match(i)]
-            max_workers = st.sidebar.slider("Параллельных потоков (workers)", 2, 30, 10)
-            results = fetch_isins_parallel(isins, max_workers=max_workers, progress_key="manual_input")
-            st.session_state["results"] = pd.DataFrame(results)
-            st.success("✅ Данные успешно получены!")
+            # validate ISINs (format + checksum)
+            invalid_format = [i for i in isins if not isin_format_valid(i)]
+            invalid_checksum = [i for i in isins if isin_format_valid(i) and not isin_checksum_valid(i)]
+            if invalid_format:
+                st.warning(
+                    f"Некорректные по формату ISIN будут пропущены: {', '.join(invalid_format[:10])}{'...' if len(invalid_format)>10 else ''}"
+                )
+            if invalid_checksum:
+                st.info(
+                    f"ISIN с неверной контрольной суммой (будут пропущены): {', '.join(invalid_checksum[:10])}{'...' if len(invalid_checksum)>10 else ''}"
+                )
+            isins = [i for i in isins if isin_format_valid(i) and isin_checksum_valid(i)]
+            if not isins:
+                st.error("Нет валидных ISIN для обработки.")
+            else:
+                max_workers = st.sidebar.slider("Параллельных потоков (workers)", 2, 40, 10)
+                with st.spinner("Запрос данных..."):
+                    results = fetch_isins_parallel(isins, max_workers=max_workers, show_progress=True)
+                st.session_state["results"] = pd.DataFrame(results)
+                st.success("✅ Данные успешно получены!")
 
-# === Обработка файла ===
+# ---------------------------
+# File upload handling
+# ---------------------------
 if uploaded_file:
     if not st.session_state["file_loaded"] or uploaded_file.name != st.session_state["last_file_name"]:
         st.session_state["file_loaded"] = True
         st.session_state["last_file_name"] = uploaded_file.name
+
         df = safe_read_filelike(uploaded_file)
         if df.empty:
             st.error("❌ Не удалось прочитать файл или файл пуст.")
             st.stop()
+        df.columns = [c.strip().upper() for c in df.columns]
+
         if "ISIN" not in df.columns:
-            # try to auto-detect column with ISIN-like values
-            candidates = [c for c in df.columns if df[c].dropna().astype(str).str.match(r'^[A-Z]{2}[A-Z0-9]{9}[0-9]$').any()]
+            # try to auto-detect ISIN-like column
+            candidates = []
+            for c in df.columns:
+                try:
+                    if df[c].dropna().astype(str).str.match(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$").any():
+                        candidates.append(c)
+                except Exception:
+                    continue
             if len(candidates) == 1:
                 df.rename(columns={candidates[0]: "ISIN"}, inplace=True)
                 st.info(f"Авто-детект: колонка '{candidates[0]}' использована как ISIN")
@@ -576,19 +653,25 @@ if uploaded_file:
         isins = df["ISIN"].dropna().unique().tolist()
         isins = [str(x).strip().upper() for x in isins if str(x).strip()]
         # validate ISINs
-        isin_pattern = re.compile(r'^[A-Z]{2}[A-Z0-9]{9}[0-9]$')
-        invalid = [i for i in isins if not isin_pattern.match(i)]
-        if invalid:
-            st.warning(f"Некорректные ISIN пропущены: {', '.join(invalid[:10])}{'...' if len(invalid)>10 else ''}")
-            isins = [i for i in isins if isin_pattern.match(i)]
+        invalid_fmt = [i for i in isins if not isin_format_valid(i)]
+        invalid_chk = [i for i in isins if isin_format_valid(i) and not isin_checksum_valid(i)]
+        if invalid_fmt:
+            st.warning(f"Некорректные по формату ISIN пропущены: {', '.join(invalid_fmt[:10])}{'...' if len(invalid_fmt)>10 else ''}")
+        if invalid_chk:
+            st.info(f"ISIN с неверной контрольной суммой пропущены: {', '.join(invalid_chk[:10])}{'...' if len(invalid_chk)>10 else ''}")
+        isins = [i for i in isins if isin_format_valid(i) and isin_checksum_valid(i)]
 
-        st.write(f"Найдено {len(isins)} уникальных ISIN для обработки.")
-        max_workers = st.sidebar.slider("Параллельных потоков (workers)", 2, 30, 10)
-        results = fetch_isins_parallel(isins, max_workers=max_workers, progress_key="file_upload")
-        st.session_state["results"] = pd.DataFrame(results)
-        st.success("✅ Данные успешно получены из файла!")
+        st.write(f"Найдено {len(isins)} валидных уникальных ISIN для обработки.")
+        if isins:
+            max_workers = st.sidebar.slider("Параллельных потоков (workers)", 2, 40, 10)
+            with st.spinner("Запрос данных по файлу..."):
+                results = fetch_isins_parallel(isins, max_workers=max_workers, show_progress=True)
+            st.session_state["results"] = pd.DataFrame(results)
+            st.success("✅ Данные успешно получены из файла!")
 
-# === Подгрузка справочника эмитентов ===
+# ---------------------------
+# Load emitter reference (optional)
+# ---------------------------
 @st.cache_data(ttl=3600)
 def fetch_emitter_names():
     url = "https://raw.githubusercontent.com/mainarkler/Bond_date/refs/heads/main/Pifagr_name_with_emitter.csv"
@@ -596,15 +679,17 @@ def fetch_emitter_names():
         df_emitters = pd.read_csv(url, dtype=str)
         df_emitters.columns = [c.strip() for c in df_emitters.columns]
         return df_emitters
-    except Exception as e:
-        st.warning(f"⚠️ Не удалось загрузить справочник эмитентов: {e}")
+    except Exception:
         return pd.DataFrame(columns=["Issuer", "EMITTER_ID"])
 
 df_emitters = fetch_emitter_names()
 
-# === Стилизация таблицы ===
+# ---------------------------
+# Styling helper
+# ---------------------------
 def style_df(row):
-    if pd.isna(row.get("Наименование инструмента")) or row.get("Наименование инструмента") in [None, "None", ""]:
+    # grey out missing instrument name
+    if pd.isna(row.get("Наименование инструмента")) or row.get("Наименование инструмента") in [None, "", "None"]:
         return ["background-color: DimGray; color: white"] * len(row)
     today = datetime.today().date()
     danger_threshold = today + timedelta(days=days_threshold)
@@ -616,78 +701,80 @@ def style_df(row):
                 d = pd.to_datetime(row[col]).date()
                 if d <= danger_threshold:
                     colors[i] = "background-color: Chocolate"
-            except:
+            except Exception:
                 pass
     if any(c == "background-color: Chocolate" for c in colors):
         colors = ["background-color: SandyBrown" if c == "" else c for c in colors]
     return colors
 
-# === Вывод результатов ===
+# ---------------------------
+# Show results (table + export)
+# ---------------------------
 if st.session_state["results"] is not None:
     df_res = st.session_state["results"].copy()
 
-    # convert Status to a column if missing
+    # ensure Status exists
     if "Status" not in df_res.columns:
         df_res["Status"] = "OK"
 
-    # merge emitters if possible
+    # merge emitters if available
     if "Код эмитента" in df_res.columns and not df_emitters.empty:
-        df_res = df_res.merge(df_emitters, how="left", left_on="Код эмитента", right_on="EMITTER_ID")
-        df_res["Эмитент"] = df_res["Issuer"]
-        df_res.drop(columns=["Issuer", "EMITTER_ID"], inplace=True, errors="ignore")
-
-        cols = df_res.columns.tolist()
-        if "Эмитент" in cols and "Код эмитента" in cols:
-            cols.remove("Эмитент")
-            idx = cols.index("Код эмитента")
-            cols.insert(idx + 1, "Эмитент")
-            df_res = df_res[cols]
-
-        st.session_state["results"] = df_res
+        try:
+            df_res = df_res.merge(df_emitters, how="left", left_on="Код эмитента", right_on="EMITTER_ID")
+            df_res["Эмитент"] = df_res.get("Issuer")
+            df_res.drop(columns=["Issuer", "EMITTER_ID"], inplace=True, errors="ignore")
+            cols = df_res.columns.tolist()
+            if "Эмитент" in cols and "Код эмитента" in cols:
+                cols.remove("Эмитент")
+                idx = cols.index("Код эмитента")
+                cols.insert(idx + 1, "Эмитент")
+                df_res = df_res[cols]
+            st.session_state["results"] = df_res
+        except Exception:
+            pass
     else:
         st.warning("⚠️ В данных нет колонки 'Код эмитента' — объединение со справочником пропущено.")
 
-    # show counts and quick filters
     st.markdown(f"**Всего записей:** {len(df_res)}")
     status_counts = df_res["Status"].value_counts().to_dict()
     st.write("Статусы:", status_counts)
 
-    # allow simple filtering by status
+    # simple status filter
     statuses = list(df_res["Status"].unique())
     chosen_statuses = st.multiselect("Фильтр по статусу", options=statuses, default=statuses)
     df_show = df_res[df_res["Status"].isin(chosen_statuses)]
 
     st.dataframe(df_show.style.apply(style_df, axis=1), use_container_width=True)
 
-    # export helpers
-    def to_excel(df):
+    # export
+    def to_excel_bytes(df: pd.DataFrame):
         output = BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Данные")
         return output.getvalue()
 
-    def to_csv_bytes(df):
+    def to_csv_bytes(df: pd.DataFrame):
         return df.to_csv(index=False).encode("utf-8-sig")
 
     st.download_button(
         label="💾 Скачать результат (Excel)",
-        data=to_excel(df_show),
+        data=to_excel_bytes(df_show),
         file_name="bond_data.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
     st.download_button(
-        label="💾 Скачать результат (CSV)",
+        label="💾 Ска��ать результат (CSV)",
         data=to_csv_bytes(df_show),
         file_name="bond_data.csv",
         mime="text/csv",
     )
 
-    # quick action: rerun selected ISINs
+    # rerun all ISINs action
     if st.button("🔁 Повторно запросить все ISIN"):
         isins_all = df_res["ISIN"].dropna().unique().tolist()
-        max_workers = st.sidebar.slider("Параллельных потоков (workers) при повторном запросе", 2, 30, 10)
+        max_workers = st.sidebar.slider("Параллельных потоков (workers) при повторном запросе", 2, 40, 10)
         with st.spinner("Повторный запрос..."):
-            new_results = fetch_isins_parallel(isins_all, max_workers=max_workers, progress_key="requery")
+            new_results = fetch_isins_parallel(isins_all, max_workers=max_workers, show_progress=True)
         st.session_state["results"] = pd.DataFrame(new_results)
         st.experimental_rerun()
 else:
