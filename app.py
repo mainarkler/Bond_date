@@ -7,8 +7,18 @@ from datetime import datetime, timedelta
 from io import BytesIO, StringIO
 import os
 import csv
+import math
+import os
 import re
+import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from io import BytesIO, StringIO
+
+import pandas as pd
+import requests
+import streamlit as st
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import time
@@ -29,9 +39,12 @@ if "file_loaded" not in st.session_state:
     st.session_state["file_loaded"] = False
 if "last_file_name" not in st.session_state:
     st.session_state["last_file_name"] = None
+if "active_view" not in st.session_state:
+    st.session_state["active_view"] = "home"
 
 # ---------------------------
 # REPO duration settings
+# Main navigation
 # ---------------------------
 st.subheader("⚙️ Настройки длительности РЕПО")
 if "overnight" not in st.session_state:
@@ -46,6 +59,11 @@ if st.button("🔄 Очистить форму"):
     st.session_state["file_loaded"] = False
     st.session_state["last_file_name"] = None
     st.experimental_rerun()
+def trigger_rerun():
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
 
 overnight = st.checkbox("Overnight РЕПО", key="overnight")
 extra_days_input = st.number_input(
@@ -64,6 +82,28 @@ if st.session_state["overnight"]:
 days_threshold = 2 if st.session_state["overnight"] else 1 + st.session_state["extra_days"]
 st.write(f"Текущее значение границы выплат: {days_threshold} дн.")
 
+if st.session_state["active_view"] != "home":
+    if st.button("⬅️ На главную"):
+        st.session_state["active_view"] = "home"
+        trigger_rerun()
+
+if st.session_state["active_view"] == "home":
+    st.subheader("🏠 Главное меню")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### 📈 Претрейд РЕПО")
+        st.caption("Анализ ISIN и ключевых дат бумаг для сделок РЕПО.")
+        if st.button("Открыть", key="open_repo", use_container_width=True):
+            st.session_state["active_view"] = "repo"
+            trigger_rerun()
+    with col2:
+        st.markdown("### 📅 Календарь выплат")
+        st.caption("Загрузка портфеля и построение календаря купонов и погашений.")
+        if st.button("Открыть", key="open_calendar", use_container_width=True):
+            st.session_state["active_view"] = "calendar"
+            trigger_rerun()
+    st.stop()
+
 # ---------------------------
 # HTTP session with retries
 # ---------------------------
@@ -79,15 +119,52 @@ session.mount("https://", adapter)
 session.mount("http://", adapter)
 session.headers.update({"User-Agent": "python-requests/iss-moex-script"})
 
+def build_http_session():
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=5,
+        backoff_factor=0.8,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({"User-Agent": "python-requests/iss-moex-script"})
+    return session
+
+
+HTTP_SESSION = build_http_session()
+
+
 def request_get(url: str, timeout: int = 15):
     """Centralized GET with session + raise for status."""
     r = session.get(url, timeout=timeout)
     r.raise_for_status()
     return r
+    response = HTTP_SESSION.get(url, timeout=timeout)
+    response.raise_for_status()
+    return response
+
+
+def parse_number(value):
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        cleaned = str(value).strip().replace(" ", "").replace(",", ".")
+        if cleaned == "":
+            return None
+        return float(cleaned)
+    except Exception:
+        return None
+
 
 # ---------------------------
 # Safe CSV/Excel reading helpers
 # ---------------------------
+
 def safe_read_csv_string(content: str) -> pd.DataFrame:
     content = content.replace("\r\n", "\n").strip()
     sample = content[:8192]
@@ -103,6 +180,7 @@ def safe_read_csv_string(content: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
+
 def safe_read_filelike(uploaded_file) -> pd.DataFrame:
     name = uploaded_file.name
     try:
@@ -112,17 +190,21 @@ def safe_read_filelike(uploaded_file) -> pd.DataFrame:
         else:
             # For Excel and others let pandas try
             return pd.read_excel(uploaded_file, dtype=str)
+        return pd.read_excel(uploaded_file, dtype=str)
     except Exception:
         return pd.DataFrame()
+
 
 # ---------------------------
 # ISIN validation (format + checksum)
 # ---------------------------
+
 def isin_format_valid(isin: str) -> bool:
     """Basic regex check for ISIN structure."""
     if not isin or not isinstance(isin, str):
         return False
     return bool(re.match(r"^[A-Z]{2}[A-Z0-9]{9}[0-9]$", isin.strip().upper()))
+
 
 def isin_checksum_valid(isin: str) -> bool:
     """ISIN checksum (Luhn-like). Returns True for valid ISINs."""
@@ -132,6 +214,7 @@ def isin_checksum_valid(isin: str) -> bool:
     # Replace letters with numbers: A=10, B=11, ..., Z=35
     converted = ""
     for ch in s[:-1]:  # checksum digit excluded at end
+    for ch in s[:-1]:
         if ch.isdigit():
             converted += ch
         else:
@@ -146,21 +229,29 @@ def isin_checksum_valid(isin: str) -> bool:
     for i, d in enumerate(arr):
         if i % 2 == parity:
             d = d * 2
+            d *= 2
             if d > 9:
                 d -= 9
         total += d
     return total % 10 == 0
 
+
 # ---------------------------
 # Load TQOB/TQCB board XML caches (for fallback)
 # ---------------------------
+
 @st.cache_data(ttl=3600)
 def fetch_board_xml(board: str):
     url = f"https://iss.moex.com/iss/engines/stock/markets/bonds/boards/{board.lower()}/securities.xml?marketprice_board=3&iss.meta=off"
+    url = (
+        "https://iss.moex.com/iss/engines/stock/markets/bonds/boards/"
+        f"{board.lower()}/securities.xml?marketprice_board=3&iss.meta=off"
+    )
     try:
         r = request_get(url, timeout=20)
         xml_content = r.content.decode("utf-8", errors="ignore")
         xml_content = re.sub(r'\sxmlns="[^"]+"', "", xml_content, count=1)
+        xml_content = re.sub(r"\sxmlns=\"[^\"]+\"", "", xml_content, count=1)
         root = ET.fromstring(xml_content)
         mapping = {}
         for el in root.iter():
@@ -175,12 +266,15 @@ def fetch_board_xml(board: str):
     except Exception:
         return {}
 
+
 TQOB_MAP = fetch_board_xml("tqob")
 TQCB_MAP = fetch_board_xml("tqcb")
+
 
 # ---------------------------
 # Fetch emitter & secid (with caching)
 # ---------------------------
+
 @st.cache_data(ttl=3600)
 def fetch_emitter_and_secid(isin: str):
     isin = str(isin).strip().upper()
@@ -216,6 +310,7 @@ def fetch_emitter_and_secid(isin: str):
             r = request_get(url, timeout=10)
             xml_content = r.content.decode("utf-8", errors="ignore")
             xml_content = re.sub(r'\sxmlns="[^"]+"', "", xml_content, count=1)
+            xml_content = re.sub(r"\sxmlns=\"[^\"]+\"", "", xml_content, count=1)
             root = ET.fromstring(xml_content)
             for node in root.iter():
                 name_attr = (node.attrib.get("name") or "").upper()
@@ -232,14 +327,20 @@ def fetch_emitter_and_secid(isin: str):
         m = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
         if m:
             secid = m.get("SECID")
+        mapping = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
+        if mapping:
+            secid = mapping.get("SECID")
             if not emitter_id:
                 emitter_id = m.get("EMITTERID")
+                emitter_id = mapping.get("EMITTERID")
 
     return emitter_id, secid
+
 
 # ---------------------------
 # Core: get bond data per ISIN
 # ---------------------------
+
 @st.cache_data(ttl=3600)
 def get_bond_data(isin: str):
     isin = str(isin).strip().upper()
@@ -332,6 +433,7 @@ def get_bond_data(isin: str):
             possible_coupon_date_cols = [c for c in cols_upper if "COUPON" in c and "DATE" in c]
             possible_record_date_cols = [c for c in cols_upper if "RECORD" in c and "DATE" in c]
             # helper to pick next future date
+
             def next_future_date(series):
                 try:
                     s = pd.to_datetime(series, errors="coerce")
@@ -461,12 +563,17 @@ def get_bond_data(isin: str):
         if (not record_date or not coupon_date or not coupon_currency) and (TQOB_MAP or TQCB_MAP):
             m = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
             if m:
+            mapping = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
+            if mapping:
                 if not record_date:
                     record_date = m.get("RECORDDATE") or m.get("RECORD_DATE") or m.get("RECORD")
+                    record_date = mapping.get("RECORDDATE") or mapping.get("RECORD_DATE") or mapping.get("RECORD")
                 if not coupon_date:
                     coupon_date = m.get("COUPONDATE") or m.get("COUPON_DATE") or m.get("COUPON")
+                    coupon_date = mapping.get("COUPONDATE") or mapping.get("COUPON_DATE") or mapping.get("COUPON")
                 if not coupon_currency:
                     coupon_currency = m.get("FACEUNIT") or m.get("FACEUNIT_S") or m.get("FACEUNIT")
+                    coupon_currency = mapping.get("FACEUNIT") or mapping.get("FACEUNIT_S") or mapping.get("FACEUNIT")
 
         # normalize dates to YYYY-MM-DD or None
         def fmt(date):
@@ -492,6 +599,7 @@ def get_bond_data(isin: str):
             "Купон %": coupon_value_prc or "",
         }
     except Exception as e:
+    except Exception:
         return {
             "ISIN": isin,
             "Код эмитента": "",
@@ -507,9 +615,138 @@ def get_bond_data(isin: str):
             "Купон %": "",
         }
 
+
+# ---------------------------
+# Calendar helpers
+# ---------------------------
+
+@st.cache_data(ttl=3600)
+def get_bond_schedule(isin: str):
+    isin = str(isin).strip().upper()
+    emitter_id, secid = fetch_emitter_and_secid(isin)
+    maturity_date = put_date = call_date = None
+    coupon_events = {}
+    facevalue = None
+
+    if secid:
+        try:
+            url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
+            r = request_get(url_info, timeout=10)
+            data_info = r.json()
+            rows_info = data_info.get("securities", {}).get("data", [])
+            cols_info = data_info.get("securities", {}).get("columns", [])
+            if rows_info and cols_info:
+                info = dict(zip([c.upper() for c in cols_info], rows_info[0]))
+                maturity_date = info.get("MATDATE") or maturity_date
+                put_date = info.get("PUTOPTIONDATE") or put_date
+                call_date = info.get("CALLOPTIONDATE") or call_date
+        except Exception:
+            pass
+
+    if not maturity_date:
+        try:
+            url_info_isin = f"https://iss.moex.com/iss/securities/{isin}.json"
+            r = request_get(url_info_isin, timeout=10)
+            data_info_isin = r.json()
+            rows = data_info_isin.get("securities", {}).get("data", [])
+            cols = data_info_isin.get("securities", {}).get("columns", [])
+            if rows and cols:
+                info = dict(zip([c.upper() for c in cols], rows[0]))
+                maturity_date = maturity_date or info.get("MATDATE")
+                put_date = put_date or info.get("PUTOPTIONDATE") or info.get("PUT_OPTION_DATE")
+                call_date = call_date or info.get("CALLOPTIONDATE") or info.get("CALL_OPTION_DATE")
+        except Exception:
+            pass
+
+    def try_fetch_bondization(identifier: str):
+        try:
+            url_coupons = (
+                "https://iss.moex.com/iss/statistics/engines/stock/markets/bonds/"
+                f"bondization/{identifier}.json?iss.only=coupons,bondization&iss.meta=off"
+            )
+            r = request_get(url_coupons, timeout=10)
+            data = r.json()
+            coupons = data.get("coupons", {}).get("data", [])
+            cols = data.get("coupons", {}).get("columns", [])
+            bond_rows = data.get("bondization", {}).get("data", [])
+            bond_cols = data.get("bondization", {}).get("columns", [])
+            bond_info = None
+            if bond_rows and bond_cols:
+                bond_info = dict(zip([c.upper() for c in bond_cols], bond_rows[0]))
+            return coupons, cols, bond_info
+        except Exception:
+            return None, [], None
+
+    coupons_data = columns_coupons = None
+    bond_info = None
+    if secid:
+        coupons_data, columns_coupons, bond_info = try_fetch_bondization(secid)
+
+    if isin and (not coupons_data or not columns_coupons):
+        coupons_data_fallback, columns_coupons_fallback, bond_info_fallback = try_fetch_bondization(isin)
+        if coupons_data_fallback and columns_coupons_fallback:
+            coupons_data = coupons_data_fallback
+            columns_coupons = columns_coupons_fallback
+        if not bond_info:
+            bond_info = bond_info_fallback or bond_info
+
+    if bond_info:
+        for key, value in bond_info.items():
+            if key.startswith("FACEVALUE") and value not in (None, "", "None"):
+                facevalue = parse_number(value)
+                if facevalue is not None:
+                    break
+
+    if coupons_data and columns_coupons:
+        df_coupons = pd.DataFrame(coupons_data, columns=columns_coupons)
+        df_coupons.columns = [c.upper() for c in df_coupons.columns]
+        date_cols = [c for c in df_coupons.columns if "COUPON" in c and "DATE" in c]
+        if not date_cols:
+            date_cols = [c for c in df_coupons.columns if c.endswith("DATE")]
+
+        val_rub_col = next((c for c in df_coupons.columns if "VALUE_RUB" in c), None)
+        val_col = next(
+            (c for c in df_coupons.columns if c in ("VALUE", "VALUE_COUPON", "COUPONVALUE")),
+            None,
+        )
+        for _, row in df_coupons.iterrows():
+            coupon_date = None
+            for col in date_cols:
+                dt = pd.to_datetime(row.get(col), errors="coerce")
+                if pd.notna(dt):
+                    coupon_date = dt.strftime("%Y-%m-%d")
+                    break
+            if not coupon_date:
+                continue
+            raw_value = row.get(val_rub_col) if val_rub_col else row.get(val_col)
+            coupon_value = parse_number(raw_value)
+            if coupon_value is None:
+                continue
+            coupon_events[coupon_date] = coupon_value
+
+    def fmt(date):
+        if pd.isna(date) or not date:
+            return None
+        try:
+            return pd.to_datetime(date).strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    return {
+        "ISIN": isin,
+        "Код эмитента": emitter_id or "",
+        "Дата погашения": fmt(maturity_date),
+        "Дата оферты Put": fmt(put_date),
+        "Дата оферты Call": fmt(call_date),
+        "Купоны": coupon_events,
+        "Номинал": facevalue,
+    }
+
+
 # ---------------------------
 # Parallel fetch with safe progress updates
 # ---------------------------
+
 def fetch_isins_parallel(isins, max_workers=10, show_progress=True):
     results = []
     total = len(isins)
@@ -568,9 +805,128 @@ def fetch_isins_parallel(isins, max_workers=10, show_progress=True):
         pass
     return results
 
+
+# ---------------------------
+# Calendar view
+# ---------------------------
+
+if st.session_state["active_view"] == "calendar":
+    st.subheader("📅 Календарь выплат")
+    st.markdown(
+        "Введите список бумаг и их количество, чтобы построить календарь выплат "
+        "(купоны, погашения, оферты) по вашему портфелю."
+    )
+    st.markdown("**Ручной ввод:** `ISIN | Amount` (количество бумаг).")
+    calendar_input = st.text_area(
+        "Введите список бумаг",
+        height=160,
+        placeholder="RU000A0JX0J2 | 100\nRU000A0ZZZY1 | 50",
+        key="calendar_manual_input",
+    )
+    if st.button("Построить календарь", key="build_calendar"):
+        raw_lines = [line.strip() for line in calendar_input.splitlines() if line.strip()]
+        entries = []
+        invalid_isins = []
+        for line in raw_lines:
+            parts = [p.strip() for p in re.split(r"[,.;|/\t]+", line) if p.strip()]
+            if not parts:
+                continue
+            isin = parts[0].upper()
+            amount = parse_number(parts[1]) if len(parts) > 1 else 1.0
+            if amount is None or amount <= 0:
+                amount = 1.0
+            if not isin_format_valid(isin) or not isin_checksum_valid(isin):
+                invalid_isins.append(isin)
+                continue
+            entries.append({"ISIN": isin, "Amount": amount})
+
+        if invalid_isins:
+            st.warning(
+                "Некорректные ISIN пропущены: "
+                f"{', '.join(invalid_isins[:10])}{'...' if len(invalid_isins) > 10 else ''}"
+            )
+        if not entries:
+            st.error("Нет валидных ISIN для построения календаря.")
+        else:
+            max_workers = st.sidebar.slider("Параллельных потоков (workers)", 2, 40, 10, key="calendar_workers")
+            timeline_data = {}
+            all_dates = set()
+            with st.spinner("Загружаем расписание выплат..."):
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_entry = {
+                        executor.submit(get_bond_schedule, entry["ISIN"]): entry for entry in entries
+                    }
+                    for future in as_completed(future_to_entry):
+                        entry = future_to_entry[future]
+                        isin = entry["ISIN"]
+                        amount = entry["Amount"]
+                        try:
+                            schedule = future.result()
+                        except Exception:
+                            schedule = {}
+                        row = {}
+                        for date, value in schedule.get("Купоны", {}).items():
+                            scaled = value * amount if value is not None else None
+                            if scaled is not None:
+                                row[date] = row.get(date, 0) + scaled
+                                all_dates.add(date)
+                        facevalue = schedule.get("Номинал")
+                        for key in ("Дата погашения", "Дата оферты Put", "Дата оферты Call"):
+                            event_date = schedule.get(key)
+                            if event_date and facevalue is not None:
+                                row[event_date] = row.get(event_date, 0) + facevalue * amount
+                                all_dates.add(event_date)
+                        timeline_data[isin] = row
+
+            sorted_dates = sorted(all_dates)
+            df_timeline = pd.DataFrame(index=[e["ISIN"] for e in entries], columns=sorted_dates, dtype=float)
+            for isin, row in timeline_data.items():
+                for date, value in row.items():
+                    df_timeline.loc[isin, date] = value
+            st.dataframe(df_timeline, use_container_width=True)
+    st.stop()
+
+
+# ---------------------------
+# REPO duration settings
+# ---------------------------
+
+st.subheader("⚙️ Настройки длительности РЕПО")
+if "overnight" not in st.session_state:
+    st.session_state["overnight"] = False
+if "extra_days" not in st.session_state:
+    st.session_state["extra_days"] = 2
+
+if st.button("🔄 Очистить форму"):
+    st.session_state["overnight"] = False
+    st.session_state["extra_days"] = 2
+    st.session_state["results"] = None
+    st.session_state["file_loaded"] = False
+    st.session_state["last_file_name"] = None
+    trigger_rerun()
+
+overnight = st.checkbox("Overnight РЕПО", key="overnight")
+extra_days_input = st.number_input(
+    "Дней РЕПО:",
+    min_value=2,
+    max_value=366,
+    step=1,
+    disabled=st.session_state["overnight"],
+    key="extra_days",
+)
+if st.session_state["overnight"]:
+    st.markdown(
+        "<span style='color:gray'>Дополнительные дни отключены при включенном Overnight</span>",
+        unsafe_allow_html=True,
+    )
+days_threshold = 2 if st.session_state["overnight"] else 1 + st.session_state["extra_days"]
+st.write(f"Текущее значение границы выплат: {days_threshold} дн.")
+
+
 # ---------------------------
 # UI: input tabs
 # ---------------------------
+
 st.subheader("📤 Загрузка или ввод ISIN")
 tab1, tab2 = st.tabs(["📁 Загрузить файл", "✍️ Ввести вручную"])
 
@@ -593,10 +949,14 @@ with tab2:
             if invalid_format:
                 st.warning(
                     f"Некорректные по формату ISIN будут пропущены: {', '.join(invalid_format[:10])}{'...' if len(invalid_format)>10 else ''}"
+                    f"Некорректные по формату ISIN будут пропущены: {', '.join(invalid_format[:10])}"
+                    f"{'...' if len(invalid_format) > 10 else ''}"
                 )
             if invalid_checksum:
                 st.info(
                     f"ISIN с неверной контрольной суммой (будут пропущены): {', '.join(invalid_checksum[:10])}{'...' if len(invalid_checksum)>10 else ''}"
+                    f"ISIN с неверной контрольной суммой (будут пропущены): {', '.join(invalid_checksum[:10])}"
+                    f"{'...' if len(invalid_checksum) > 10 else ''}"
                 )
             isins = [i for i in isins if isin_format_valid(i) and isin_checksum_valid(i)]
             if not isins:
@@ -608,9 +968,11 @@ with tab2:
                 st.session_state["results"] = pd.DataFrame(results)
                 st.success("✅ Данные успешно получены!")
 
+
 # ---------------------------
 # File upload handling
 # ---------------------------
+
 if uploaded_file:
     if not st.session_state["file_loaded"] or uploaded_file.name != st.session_state["last_file_name"]:
         st.session_state["file_loaded"] = True
@@ -645,8 +1007,16 @@ if uploaded_file:
         invalid_chk = [i for i in isins if isin_format_valid(i) and not isin_checksum_valid(i)]
         if invalid_fmt:
             st.warning(f"Некорректные по формату ISIN пропущены: {', '.join(invalid_fmt[:10])}{'...' if len(invalid_fmt)>10 else ''}")
+            st.warning(
+                f"Некорректные по формату ISIN пропущены: {', '.join(invalid_fmt[:10])}"
+                f"{'...' if len(invalid_fmt) > 10 else ''}"
+            )
         if invalid_chk:
             st.info(f"ISIN с неверной контрольной суммой пропущены: {', '.join(invalid_chk[:10])}{'...' if len(invalid_chk)>10 else ''}")
+            st.info(
+                f"ISIN с неверной контрольной суммой пропущены: {', '.join(invalid_chk[:10])}"
+                f"{'...' if len(invalid_chk) > 10 else ''}"
+            )
         isins = [i for i in isins if isin_format_valid(i) and isin_checksum_valid(i)]
 
         st.write(f"Найдено {len(isins)} валидных уникальных ISIN для обработки.")
@@ -657,9 +1027,11 @@ if uploaded_file:
             st.session_state["results"] = pd.DataFrame(results)
             st.success("✅ Данные успешно получены из файла!")
 
+
 # ---------------------------
 # Load emitter reference (optional)
 # ---------------------------
+
 @st.cache_data(ttl=3600)
 def fetch_emitter_names():
     url = "https://raw.githubusercontent.com/mainarkler/Bond_date/refs/heads/main/Pifagr_name_with_emitter.csv"
@@ -670,11 +1042,14 @@ def fetch_emitter_names():
     except Exception:
         return pd.DataFrame(columns=["Issuer", "EMITTER_ID"])
 
+
 df_emitters = fetch_emitter_names()
+
 
 # ---------------------------
 # Styling helper
 # ---------------------------
+
 def style_df(row):
     # grey out missing instrument name
     if pd.isna(row.get("Наименование инструмента")) or row.get("Наименование инструмента") in [None, "", "None"]:
@@ -695,9 +1070,11 @@ def style_df(row):
         colors = ["background-color: SandyBrown" if c == "" else c for c in colors]
     return colors
 
+
 # ---------------------------
 # Show results (table + export) with filter for orange-highlighted rows
 # ---------------------------
+
 if st.session_state["results"] is not None:
     df_res = st.session_state["results"].copy()
 
