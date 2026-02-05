@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+
 import csv
 import math
 import re
@@ -755,15 +755,26 @@ if st.session_state["active_view"] == "calendar":
                         except Exception:
                             schedule = {}
                         row = {}
+                        today = datetime.today().date()
                         for date, value in schedule.get("Купоны", {}).items():
                             scaled = value * amount if value is not None else None
-                            if scaled is not None:
+                            if scaled is None:
+                                continue
+                            try:
+                                coupon_date = pd.to_datetime(date).date()
+                            except Exception:
+                                continue
+                            if coupon_date >= today:
                                 row[date] = row.get(date, 0) + scaled
                                 all_dates.add(date)
                         facevalue = schedule.get("Номинал")
-                        for key in ("Дата погашения", "Дата оферты Put", "Дата оферты Call"):
-                            event_date = schedule.get(key)
-                            if event_date and facevalue is not None:
+                        event_date = schedule.get("Дата погашения")
+                        if event_date and facevalue is not None:
+                            try:
+                                maturity_date = pd.to_datetime(event_date).date()
+                            except Exception:
+                                maturity_date = None
+                            if maturity_date and maturity_date >= today:
                                 row[event_date] = row.get(event_date, 0) + facevalue * amount
                                 all_dates.add(event_date)
                         timeline_data[isin] = row
