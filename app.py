@@ -1,4 +1,4 @@
-
+# -*- coding: utf-8 -*-
 import csv
 import math
 import re
@@ -49,7 +49,7 @@ if st.session_state["active_view"] != "home":
 
 if st.session_state["active_view"] == "home":
     st.subheader("🏠 Главное меню")
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         st.markdown("### 📈 Претрейд РЕПО")
         st.caption("Анализ ISIN и ключевых дат бумаг для сделок РЕПО.")
@@ -61,6 +61,12 @@ if st.session_state["active_view"] == "home":
         st.caption("Загрузка портфеля и построение календаря купонов и погашений.")
         if st.button("Открыть", key="open_calendar", use_container_width=True):
             st.session_state["active_view"] = "calendar"
+            trigger_rerun()
+    with col3:
+        st.markdown("### 🧮 Расчет VM")
+        st.caption("Расчет вариационной маржи по фьючерсам FORTS.")
+        if st.button("Открыть", key="open_vm", use_container_width=True):
+            st.session_state["active_view"] = "vm"
             trigger_rerun()
     st.stop()
 
@@ -103,6 +109,68 @@ def parse_number(value):
         return float(cleaned)
     except Exception:
         return None
+
+
+@st.cache_data(ttl=3600)
+def fetch_forts_secid_map():
+    url = "https://iss.moex.com/iss/engines/futures/markets/forts/securities.json"
+    params = {
+        "iss.meta": "off",
+        "iss.only": "securities",
+        "securities.columns": "SECID,SHORTNAME",
+    }
+    resp = request_get(url, timeout=20).json()
+    rows = resp.get("securities", {}).get("data", [])
+    mapping = {}
+    for row in rows:
+        if len(row) < 2:
+            continue
+        secid, shortname = row[0], row[1]
+        if shortname:
+            mapping[shortname] = secid
+    return mapping
+
+
+def fetch_vm_data(trade_name: str):
+    secid_map = fetch_forts_secid_map()
+    secid = secid_map.get(trade_name)
+    if not secid:
+        raise RuntimeError(f"Контракт {trade_name} не найден в FORTS")
+
+    spec_url = f"https://iss.moex.com/iss/engines/futures/markets/forts/securities/{secid}.json"
+    spec_params = {
+        "iss.meta": "off",
+        "iss.only": "securities",
+        "securities.columns": "MINSTEP,STEPPRICE",
+    }
+    spec = request_get(spec_url, timeout=20).json()
+    minstep, stepprice = spec["securities"]["data"][0]
+    multiplier = stepprice / minstep
+
+    hist_url = f"https://iss.moex.com/iss/history/engines/futures/markets/forts/securities/{secid}.json"
+    hist_params = {
+        "iss.meta": "off",
+        "iss.only": "history",
+        "history.columns": "TRADEDATE,SETTLEPRICE",
+    }
+    history = request_get(hist_url, timeout=20).json()
+    rows = history.get("history", {}).get("data", [])
+    if len(rows) < 2:
+        raise RuntimeError("Недостаточно данных для расчёта вариационной маржи")
+
+    prev_date, prev_price = rows[-2]
+    today_date, today_price = rows[-1]
+    vm = (today_price - prev_price) * multiplier
+
+    return {
+        "TRADE_NAME": trade_name,
+        "SECID": secid,
+        "TRADEDATE": today_date,
+        "PREV_PRICE": prev_price,
+        "TODAY_PRICE": today_price,
+        "MULTIPLIER": multiplier,
+        "VM": vm,
+    }
 
 
 # ---------------------------
@@ -614,8 +682,6 @@ def get_bond_schedule(isin: str):
                 continue
             raw_value = row.get(val_rub_col) if val_rub_col else row.get(val_col)
             coupon_value = parse_number(raw_value)
-            if coupon_value is None:
-                continue
             coupon_events[coupon_date] = coupon_value
 
     def fmt(date):
@@ -756,27 +822,44 @@ if st.session_state["active_view"] == "calendar":
                             schedule = {}
                         row = {}
                         today = datetime.today().date()
+                        maturity_date = None
+                        for key in ("Дата погашения", "Дата оферты Put", "Дата оферты Call"):
+                            event_date = schedule.get(key)
+                            if event_date:
+                                try:
+                                    parsed_date = pd.to_datetime(event_date).date()
+                                except Exception:
+                                    parsed_date = None
+                                if parsed_date and (maturity_date is None or parsed_date < maturity_date):
+                                    maturity_date = parsed_date
+                                if parsed_date and parsed_date >= today:
+                                    all_dates.add(event_date)
+
                         for date, value in schedule.get("Купоны", {}).items():
-                            scaled = value * amount if value is not None else None
-                            if scaled is None:
-                                continue
                             try:
                                 coupon_date = pd.to_datetime(date).date()
                             except Exception:
                                 continue
-                            if coupon_date >= today:
-                                row[date] = row.get(date, 0) + scaled
-                                all_dates.add(date)
+                            if coupon_date < today:
+                                continue
+                            if maturity_date and coupon_date > maturity_date:
+                                continue
+                            all_dates.add(date)
+                            if value is None:
+                                continue
+                            scaled = value * amount
+                            row[date] = row.get(date, 0) + scaled
+
                         facevalue = schedule.get("Номинал")
-                        event_date = schedule.get("Дата погашения")
-                        if event_date and facevalue is not None:
-                            try:
-                                maturity_date = pd.to_datetime(event_date).date()
-                            except Exception:
-                                maturity_date = None
-                            if maturity_date and maturity_date >= today:
-                                row[event_date] = row.get(event_date, 0) + facevalue * amount
-                                all_dates.add(event_date)
+                        for key in ("Дата погашения", "Дата оферты Put", "Дата оферты Call"):
+                            event_date = schedule.get(key)
+                            if event_date and facevalue is not None:
+                                try:
+                                    parsed_date = pd.to_datetime(event_date).date()
+                                except Exception:
+                                    parsed_date = None
+                                if parsed_date and parsed_date >= today:
+                                    row[event_date] = row.get(event_date, 0) + facevalue * amount
                         timeline_data[isin] = row
 
             sorted_dates = sorted(all_dates)
@@ -785,6 +868,39 @@ if st.session_state["active_view"] == "calendar":
                 for date, value in row.items():
                     df_timeline.loc[isin, date] = value
             st.dataframe(df_timeline, use_container_width=True)
+    st.stop()
+
+# ---------------------------
+# VM view
+# ---------------------------
+if st.session_state["active_view"] == "vm":
+    st.subheader("🧮 Расчет VM")
+    trade_name = st.text_input("TRADE_NAME (SHORTNAME биржи)", value="", key="vm_trade_name")
+    quantity = st.number_input(
+        "Кол-во (целое, неотрицательное)",
+        min_value=0,
+        step=1,
+        value=0,
+        format="%d",
+        key="vm_quantity",
+    )
+    if st.button("Рассчитать VM", key="vm_calculate"):
+        if not trade_name.strip():
+            st.error("Введите TRADE_NAME.")
+        else:
+            try:
+                vm_data = fetch_vm_data(trade_name.strip())
+                position_vm = vm_data["VM"] * quantity
+                st.markdown(f"**Инструмент:** {vm_data['TRADE_NAME']}")
+                st.markdown(f"**SECID:** {vm_data['SECID']}")
+                st.markdown(f"**Дата клиринга:** {vm_data['TRADEDATE']}")
+                st.markdown(f"**SETTLEPRICE вчера:** {vm_data['PREV_PRICE']}")
+                st.markdown(f"**SETTLEPRICE сегодня:** {vm_data['TODAY_PRICE']}")
+                st.markdown(f"**Multiplier:** {vm_data['MULTIPLIER']}")
+                st.markdown(f"**Вариационная маржа за день:** {vm_data['VM']:.2f}")
+                st.markdown(f"**Маржа позиции (VM × Кол-во):** {position_vm:.2f}")
+            except Exception as exc:
+                st.error(str(exc))
     st.stop()
 
 # ---------------------------
