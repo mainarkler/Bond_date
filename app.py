@@ -112,7 +112,7 @@ def parse_number(value):
 
 
 @st.cache_data(ttl=3600)
-def fetch_forts_secid_map():
+def fetch_forts_securities():
     url = "https://iss.moex.com/iss/engines/futures/markets/forts/securities.json"
     params = {
         "iss.meta": "off",
@@ -120,22 +120,46 @@ def fetch_forts_secid_map():
         "securities.columns": "SECID,SHORTNAME",
     }
     resp = request_get(url, timeout=20).json()
-    rows = resp.get("securities", {}).get("data", [])
+    return resp.get("securities", {}).get("data", [])
+
+
+@st.cache_data(ttl=3600)
+def fetch_forts_secid_map():
+    rows = fetch_forts_securities()
     mapping = {}
     for row in rows:
         if len(row) < 2:
             continue
         secid, shortname = row[0], row[1]
         if shortname:
-            mapping[shortname] = secid
+            mapping[str(shortname).upper()] = secid
     return mapping
 
 
 def fetch_vm_data(trade_name: str):
+    trade_name_clean = trade_name.strip()
+    trade_name_upper = trade_name_clean.upper()
     secid_map = fetch_forts_secid_map()
-    secid = secid_map.get(trade_name)
+    secid = secid_map.get(trade_name_upper)
     if not secid:
-        raise RuntimeError(f"Контракт {trade_name} не найден в FORTS")
+        rows = fetch_forts_securities()
+        secid_match = [row[0] for row in rows if len(row) >= 1 and str(row[0]).upper() == trade_name_upper]
+        if secid_match:
+            secid = secid_match[0]
+        else:
+            partial = [
+                row[0]
+                for row in rows
+                if len(row) >= 2 and trade_name_upper in str(row[1]).upper()
+            ]
+            if len(partial) == 1:
+                secid = partial[0]
+            elif len(partial) > 1:
+                raise RuntimeError(
+                    f"Найдено несколько контрактов для {trade_name_clean}: {', '.join(partial[:5])}"
+                )
+    if not secid:
+        raise RuntimeError(f"Контракт {trade_name_clean} не найден в FORTS")
 
     spec_url = f"https://iss.moex.com/iss/engines/futures/markets/forts/securities/{secid}.json"
     spec_params = {
@@ -163,7 +187,7 @@ def fetch_vm_data(trade_name: str):
     vm = (today_price - prev_price) * multiplier
 
     return {
-        "TRADE_NAME": trade_name,
+        "TRADE_NAME": trade_name_clean,
         "SECID": secid,
         "TRADEDATE": today_date,
         "PREV_PRICE": prev_price,
