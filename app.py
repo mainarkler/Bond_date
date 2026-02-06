@@ -126,7 +126,7 @@ def extract_secid_shortname(row):
 @st.cache_data(ttl=3600)
 def fetch_forts_securities():
     url = "https://iss.moex.com/iss/engines/futures/markets/forts/securities.xml"
-    r = request_get(f"{url}?iss.meta=off&iss.only=securities&securities.columns=SECID,SHORTNAME")
+    r = request_get(f"{url}?iss.meta=off&iss.only=securities&securities.columns=SECID,SHORTNAME", timeout=20)
     xml_content = r.content.decode("utf-8", errors="ignore")
     xml_content = re.sub(r'\sxmlns="[^"]+"', "", xml_content, count=1)
     root = ET.fromstring(xml_content)
@@ -158,11 +158,17 @@ def normalize_trade_key(value: str) -> str:
     return normalized
 
 
-def fetch_vm_data(trade_name: str):
+def fetch_vm_data(trade_name: str, forts_rows=None):
     trade_name_clean = trade_name.strip()
     trade_name_upper = trade_name_clean.upper()
     trade_name_norm = normalize_trade_key(trade_name_clean)
-    secid_map = fetch_forts_secid_map()
+    if forts_rows is None:
+        forts_rows = fetch_forts_securities()
+    secid_map = {}
+    for row in forts_rows:
+        secid, shortname = extract_secid_shortname(row)
+        if shortname:
+            secid_map[str(shortname).upper()] = secid
     secid = secid_map.get(trade_name_upper)
     if not secid and trade_name_norm:
         normalized_map = {
@@ -170,10 +176,9 @@ def fetch_vm_data(trade_name: str):
         }
         secid = normalized_map.get(trade_name_norm)
     if not secid:
-        rows = fetch_forts_securities()
         secid_match = [
             extract_secid_shortname(row)[0]
-            for row in rows
+            for row in forts_rows
             if str(extract_secid_shortname(row)[0]).upper() == trade_name_upper
         ]
         if secid_match:
@@ -181,7 +186,7 @@ def fetch_vm_data(trade_name: str):
         else:
             partial = [
                 extract_secid_shortname(row)[0]
-                for row in rows
+                for row in forts_rows
                 if trade_name_upper in str(extract_secid_shortname(row)[1]).upper()
             ]
             if len(partial) == 1:
@@ -193,7 +198,7 @@ def fetch_vm_data(trade_name: str):
             elif trade_name_norm:
                 normalized_matches = [
                     extract_secid_shortname(row)[0]
-                    for row in rows
+                    for row in forts_rows
                     if trade_name_norm in normalize_trade_key(extract_secid_shortname(row)[1])
                 ]
                 if len(normalized_matches) == 1:
@@ -947,6 +952,13 @@ if st.session_state["active_view"] == "calendar":
 # ---------------------------
 if st.session_state["active_view"] == "vm":
     st.subheader("🧮 Расчет VM")
+    if "forts_contracts" not in st.session_state:
+        with st.spinner("Загружаем список контрактов FORTS..."):
+            try:
+                st.session_state["forts_contracts"] = fetch_forts_securities()
+            except Exception:
+                st.session_state["forts_contracts"] = []
+                st.warning("Не удалось загрузить список контрактов FORTS.")
     trade_name = st.text_input("TRADE_NAME (SHORTNAME биржи)", value="", key="vm_trade_name")
     quantity = st.number_input(
         "Кол-во (целое, неотрицательное)",
@@ -961,7 +973,7 @@ if st.session_state["active_view"] == "vm":
             st.error("Введите TRADE_NAME.")
         else:
             try:
-                vm_data = fetch_vm_data(trade_name.strip())
+                vm_data = fetch_vm_data(trade_name.strip(), st.session_state.get("forts_contracts"))
                 position_vm = vm_data["VM"] * quantity
                 st.markdown(f"**Инструмент:** {vm_data['TRADE_NAME']}")
                 st.markdown(f"**SECID:** {vm_data['SECID']}")
