@@ -19,7 +19,7 @@ from urllib3.util.retry import Retry
 # Streamlit page setup
 # ---------------------------
 st.set_page_config(page_title="РЕПО претрейд", page_icon="📈", layout="wide")
-st.title("📈 РЕПО претрейд")
+st.title("📈 stat bord")
 
 # ---------------------------
 # Session state defaults
