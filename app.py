@@ -1025,15 +1025,15 @@ if st.session_state["active_view"] == "vm":
                 st.markdown(
                     f"**Расчетная цена последнего клиринга:** {vm_data['LAST_SETTLE_PRICE']}"
                 )
-                st.markdown(f"**SETTLEPRICE сегодня:** {vm_data['TODAY_PRICE']}")
+                st.markdown(f"**Последняя цена:** {vm_data['TODAY_PRICE']}")
                 st.markdown(f"**Multiplier:** {vm_data['MULTIPLIER']}")
                 st.markdown(f"**Вариационная маржа за день:** {vm_data['VM']:.2f}")
                 st.markdown(f"**Маржа позиции (VM × Кол-во):** {position_vm:.2f}")
                 usd_rub_data = get_usd_rub_cb_today()
                 usd_rub = float(usd_rub_data["usd_rub"])
                 limit_sum = (0.05 * vm_data["TODAY_PRICE"] * quantity * usd_rub) + position_vm
-                st.markdown(f"**Сумма отграничения:** {limit_sum:.2f}")
-                st.caption(f"USD/RUB ЦБ: {usd_rub_data['usd_rub']} на {usd_rub_data['date']}")
+                st.markdown(f"**Сумма ограничения:** {limit_sum:.2f}")
+                st.caption(f"USD/RUB: {usd_rub_data['usd_rub']} на {usd_rub_data['date']}")
             except Exception as exc:
                 st.error(str(exc))
     st.stop()
