@@ -6,6 +6,7 @@ import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO, StringIO
 
 import pandas as pd
@@ -163,6 +164,14 @@ def normalize_trade_key(value: str) -> str:
     return normalized
 
 
+def to_decimal(value) -> Decimal:
+    return Decimal(str(value))
+
+
+def money_decimal(value: Decimal) -> Decimal:
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
 def fetch_vm_data(trade_name: str, forts_rows=None):
     trade_name_clean = trade_name.strip()
     trade_name_upper = trade_name_clean.upper()
@@ -219,37 +228,43 @@ def fetch_vm_data(trade_name: str, forts_rows=None):
     spec_params = {
         "iss.meta": "off",
         "iss.only": "securities",
-        "securities.columns": "MINSTEP,STEPPRICE,LASTSETTLEPRICE",
+        "securities.columns": "PREVSETTLEPRICE,MINSTEP,STEPPRICE,LASTSETTLEPRICE",
     }
     spec = request_get(spec_url, timeout=20, params=spec_params).json()
-    minstep, stepprice, last_settle_price = spec["securities"]["data"][0]
-    multiplier = stepprice / minstep
+    prev_settle_raw, minstep_raw, stepprice_raw, last_settle_raw = spec["securities"]["data"][0]
+    prev_settle = to_decimal(prev_settle_raw)
+    minstep = to_decimal(minstep_raw)
+    stepprice = to_decimal(stepprice_raw)
+    last_settle = to_decimal(last_settle_raw) if last_settle_raw is not None else None
 
     hist_url = f"https://iss.moex.com/iss/history/engines/futures/markets/forts/securities/{secid}.json"
     hist_params = {
         "iss.meta": "off",
         "iss.only": "history",
-        "history.columns": "TRADEDATE,SETTLEPRICE",
+        "history.columns": "TRADEDATE,SETTLEPRICEDAY",
+        "sort_order": "desc",
+        "limit": 1,
     }
     history = request_get(hist_url, timeout=20, params=hist_params).json()
     rows = history.get("history", {}).get("data", [])
-    if len(rows) < 2:
-        raise RuntimeError("Недостаточно данных для расчёта вариационной маржи")
+    if not rows or rows[0][1] is None:
+        raise RuntimeError("Дневной клиринг ещё не опубликован")
 
-    prev_date, prev_price = rows[-2]
-    today_date, history_today_price = rows[-1]
-    today_price = last_settle_price if last_settle_price is not None else history_today_price
-    vm = (today_price - prev_price) * multiplier
+    trade_date, day_settle_raw = rows[0]
+    day_settle = to_decimal(day_settle_raw)
+
+    multiplier = stepprice / minstep
+    vm = (day_settle - prev_settle) * multiplier
 
     return {
         "TRADE_NAME": trade_name_clean,
         "SECID": secid,
-        "TRADEDATE": datetime.today().strftime("%Y-%m-%d"),
-        "PREV_PRICE": prev_price,
-        "LAST_SETTLE_PRICE": last_settle_price,
-        "TODAY_PRICE": today_price,
-        "MULTIPLIER": multiplier,
-        "VM": vm,
+        "TRADEDATE": trade_date,
+        "PREV_PRICE": float(money_decimal(prev_settle)),
+        "LAST_SETTLE_PRICE": float(money_decimal(last_settle)) if last_settle is not None else None,
+        "TODAY_PRICE": float(money_decimal(day_settle)),
+        "MULTIPLIER": float(multiplier),
+        "VM": float(money_decimal(vm)),
     }
 
 
@@ -882,7 +897,7 @@ if st.session_state["active_view"] == "calendar":
 
         if invalid_isins:
             st.warning(
-                "Некорректные ISIN пропущены: "
+                "Некоректные ISIN пропущены: "
                 f"{', '.join(invalid_isins[:10])}{'...' if len(invalid_isins) > 10 else ''}"
             )
         if not entries:
@@ -1179,7 +1194,7 @@ if st.session_state["results"] is not None:
             if "Эмитент" in cols and "Код эмитента" in cols:
                 cols.remove("Эмитент")
                 idx = cols.index("Код эмитента")
-                cols.insert(idx + 1, "митент")
+                cols.insert(idx + 1, "Эмитент")
                 df_res = df_res[cols]
             st.session_state["results"] = df_res
         except Exception:
