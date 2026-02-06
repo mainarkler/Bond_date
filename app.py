@@ -113,14 +113,24 @@ def parse_number(value):
 
 @st.cache_data(ttl=3600)
 def fetch_forts_securities():
-    url = "https://iss.moex.com/iss/engines/futures/markets/forts/securities.json"
+    url = "https://iss.moex.com/iss/engines/futures/markets/forts/securities.xml"
     params = {
         "iss.meta": "off",
         "iss.only": "securities",
         "securities.columns": "SECID,SHORTNAME",
     }
-    resp = request_get(url, timeout=20).json()
-    return resp.get("securities", {}).get("data", [])
+    r = request_get(url, timeout=20)
+    xml_content = r.content.decode("utf-8", errors="ignore")
+    xml_content = re.sub(r'\sxmlns="[^"]+"', "", xml_content, count=1)
+    root = ET.fromstring(xml_content)
+    rows = []
+    for el in root.iter():
+        if el.tag.lower().endswith("row"):
+            secid = el.attrib.get("SECID") or ""
+            shortname = el.attrib.get("SHORTNAME") or ""
+            if secid or shortname:
+                rows.append([secid, shortname])
+    return rows
 
 
 @st.cache_data(ttl=3600)
@@ -136,11 +146,24 @@ def fetch_forts_secid_map():
     return mapping
 
 
+def normalize_trade_key(value: str) -> str:
+    if not value:
+        return ""
+    normalized = re.sub(r"[^A-Z0-9]", "", str(value).upper())
+    return normalized
+
+
 def fetch_vm_data(trade_name: str):
     trade_name_clean = trade_name.strip()
     trade_name_upper = trade_name_clean.upper()
+    trade_name_norm = normalize_trade_key(trade_name_clean)
     secid_map = fetch_forts_secid_map()
     secid = secid_map.get(trade_name_upper)
+    if not secid and trade_name_norm:
+        normalized_map = {
+            normalize_trade_key(shortname): secid_value for shortname, secid_value in secid_map.items()
+        }
+        secid = normalized_map.get(trade_name_norm)
     if not secid:
         rows = fetch_forts_securities()
         secid_match = [row[0] for row in rows if len(row) >= 1 and str(row[0]).upper() == trade_name_upper]
@@ -158,6 +181,18 @@ def fetch_vm_data(trade_name: str):
                 raise RuntimeError(
                     f"Найдено несколько контрактов для {trade_name_clean}: {', '.join(partial[:5])}"
                 )
+            elif trade_name_norm:
+                normalized_matches = [
+                    row[0]
+                    for row in rows
+                    if len(row) >= 2 and trade_name_norm in normalize_trade_key(row[1])
+                ]
+                if len(normalized_matches) == 1:
+                    secid = normalized_matches[0]
+                elif len(normalized_matches) > 1:
+                    raise RuntimeError(
+                        f"Найдено несколько контрактов для {trade_name_clean}: {', '.join(normalized_matches[:5])}"
+                    )
     if not secid:
         raise RuntimeError(f"Контракт {trade_name_clean} не найден в FORTS")
 
@@ -626,6 +661,8 @@ def get_bond_schedule(isin: str):
                 maturity_date = info.get("MATDATE") or maturity_date
                 put_date = info.get("PUTOPTIONDATE") or put_date
                 call_date = info.get("CALLOPTIONDATE") or call_date
+                if facevalue is None:
+                    facevalue = parse_number(info.get("FACEVALUE") or info.get("FACEVALUE_RUB"))
         except Exception:
             pass
 
@@ -641,6 +678,8 @@ def get_bond_schedule(isin: str):
                 maturity_date = maturity_date or info.get("MATDATE")
                 put_date = put_date or info.get("PUTOPTIONDATE") or info.get("PUT_OPTION_DATE")
                 call_date = call_date or info.get("CALLOPTIONDATE") or info.get("CALL_OPTION_DATE")
+                if facevalue is None:
+                    facevalue = parse_number(info.get("FACEVALUE") or info.get("FACEVALUE_RUB"))
         except Exception:
             pass
 
@@ -910,7 +949,7 @@ if st.session_state["active_view"] == "vm":
     )
     if st.button("Рассчитать VM", key="vm_calculate"):
         if not trade_name.strip():
-            st.error("Введите TRADE_NAME.")
+            st.error("Ведите TRADE_NAME.")
         else:
             try:
                 vm_data = fetch_vm_data(trade_name.strip())
@@ -1042,126 +1081,23 @@ if uploaded_file:
             )
         if invalid_chk:
             st.info(
-                f"ISIN с неверной контрольной суммой пропущены: {', '.join(invalid_chk[:10])}"
+                f"ISIN с неверной контрольной суммой (будут пропущены): {', '.join(invalid_chk[:10])}"
                 f"{'...' if len(invalid_chk) > 10 else ''}"
             )
-        isins = [i for i in isins if isin_format_valid(i) and isin_checksum_valid(i)]
 
-        st.write(f"Найдено {len(isins)} валидных уникальных ISIN для обработки.")
-        if isins:
+        isins = [i for i in isins if isin_format_valid(i) and isin_checksum_valid(i)]
+        if not isins:
+            st.error("Нет валидных ISIN для обработки.")
+        else:
             max_workers = st.sidebar.slider("Параллельных потоков (workers)", 2, 40, 10)
-            with st.spinner("Запрос данных по файлу..."):
+            with st.spinner("Запрос данных..."):
                 results = fetch_isins_parallel(isins, max_workers=max_workers, show_progress=True)
             st.session_state["results"] = pd.DataFrame(results)
-            st.success("✅ Данные успешно получены из файла!")
+            st.success("✅ Данные успешно получены!")
 
 # ---------------------------
-# Load emitter reference (optional)
+# Render results if available
 # ---------------------------
-@st.cache_data(ttl=3600)
-def fetch_emitter_names():
-    url = "https://raw.githubusercontent.com/mainarkler/Bond_date/refs/heads/main/Pifagr_name_with_emitter.csv"
-    try:
-        df_emitters = pd.read_csv(url, dtype=str)
-        df_emitters.columns = [c.strip() for c in df_emitters.columns]
-        return df_emitters
-    except Exception:
-        return pd.DataFrame(columns=["Issuer", "EMITTER_ID"])
-
-
-df_emitters = fetch_emitter_names()
-
-# ---------------------------
-# Styling helper
-# ---------------------------
-def style_df(row):
-    if pd.isna(row.get("Наименование инструмента")) or row.get("Наименование инструмента") in [None, "", "None"]:
-        return ["background-color: DimGray; color: white"] * len(row)
-    today = datetime.today().date()
-    danger_threshold = today + timedelta(days=days_threshold)
-    key_dates = ["Дата погашения", "Дата оферты Put", "Дата оферты Call", "Дата фиксации купона", "Дата купона"]
-    colors = ["" for _ in row]
-    for i, col in enumerate(row.index):
-        if col in key_dates and pd.notnull(row[col]):
-            try:
-                d = pd.to_datetime(row[col]).date()
-                if d <= danger_threshold:
-                    colors[i] = "background-color: Chocolate"
-            except Exception:
-                pass
-    if any(c == "background-color: Chocolate" for c in colors):
-        colors = ["background-color: SandyBrown" if c == "" else c for c in colors]
-    return colors
-
-# ---------------------------
-# Show results (table + export) with filter for orange-highlighted rows
-# ---------------------------
-if st.session_state["results"] is not None:
-    df_res = st.session_state["results"].copy()
-
-    if "Код эмитента" in df_res.columns and not df_emitters.empty:
-        try:
-            df_res = df_res.merge(df_emitters, how="left", left_on="Код эмитента", right_on="EMITTER_ID")
-            df_res["Эмитент"] = df_res.get("Issuer")
-            df_res.drop(columns=["Issuer", "EMITTER_ID"], inplace=True, errors="ignore")
-            cols = df_res.columns.tolist()
-            if "Эмитент" in cols and "Код эмитента" in cols:
-                cols.remove("Эмитент")
-                idx = cols.index("Код эмитента")
-                cols.insert(idx + 1, "Эмитент")
-                df_res = df_res[cols]
-            st.session_state["results"] = df_res
-        except Exception:
-            pass
-    else:
-        st.warning("⚠️ В данных нет колонки 'Код эмитента' — объединение со справочником пропущено.")
-
-    st.markdown(f"**Всего записей:** {len(df_res)}")
-
-    today = datetime.today().date()
-    danger_threshold = today + timedelta(days=days_threshold)
-    key_dates = ["Дата погашения", "Дата оферты Put", "Дата оферты Call", "Дата фиксации купона", "Дата купона"]
-
-    mask_any = pd.Series(False, index=df_res.index)
-    for col in key_dates:
-        if col in df_res.columns:
-            try:
-                s = pd.to_datetime(df_res[col], errors="coerce").dt.date
-                mask_any = mask_any | (s <= danger_threshold)
-            except Exception:
-                pass
-
-    only_orange = st.checkbox("Показать бумаги с отсечкой в периоде", value=False)
-    if only_orange:
-        df_show = df_res[mask_any].copy()
-        st.markdown(f"**Показано записей с отсечкой:** {len(df_show)}")
-        if df_show.empty:
-            st.info("Нет бумаг, попадающих под критерий (отсечки).")
-    else:
-        df_show = df_res
-
-    st.dataframe(df_show.style.apply(style_df, axis=1), use_container_width=True)
-
-    def to_excel_bytes(df: pd.DataFrame):
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Данные")
-        return output.getvalue()
-
-    def to_csv_bytes(df: pd.DataFrame):
-        return df.to_csv(index=False).encode("utf-8-sig")
-
-    st.download_button(
-        label="💾 Скачать результат (Excel)",
-        data=to_excel_bytes(df_show),
-        file_name="bond_data.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    st.download_button(
-        label="💾 Скачать результат (CSV)",
-        data=to_csv_bytes(df_show),
-        file_name="bond_data.csv",
-        mime="text/csv",
-    )
-else:
-    st.info("👆 Загрузите файл или введите ISIN-ы вручную.")
+if st.session_state.get("results") is not None:
+    st.subheader("📊 Результаты")
+    st.dataframe(st.session_state["results"], use_container_width=True)
