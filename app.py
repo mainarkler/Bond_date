@@ -57,7 +57,7 @@ if st.session_state["active_view"] == "home":
             st.session_state["active_view"] = "repo"
             trigger_rerun()
     with col2:
-        st.markdown("### 📅 Календарь выплат")
+        st.markdown("### 📅 Календарь вплат")
         st.caption("Загрузка портфеля и построение календаря купонов и погашений.")
         if st.button("Открыть", key="open_calendar", use_container_width=True):
             st.session_state["active_view"] = "calendar"
@@ -91,8 +91,8 @@ def build_http_session():
 HTTP_SESSION = build_http_session()
 
 
-def request_get(url: str, timeout: int = 15):
-    response = HTTP_SESSION.get(url, timeout=timeout)
+def request_get(url: str, timeout: int = 15, params=None):
+    response = HTTP_SESSION.get(url, timeout=timeout, params=params)
     response.raise_for_status()
     return response
 
@@ -126,7 +126,12 @@ def extract_secid_shortname(row):
 @st.cache_data(ttl=3600)
 def fetch_forts_securities():
     url = "https://iss.moex.com/iss/engines/futures/markets/forts/securities.xml"
-    r = request_get(f"{url}?iss.meta=off&iss.only=securities&securities.columns=SECID,SHORTNAME", timeout=20)
+    params = {
+        "iss.meta": "off",
+        "iss.only": "securities",
+        "securities.columns": "SECID,SHORTNAME",
+    }
+    r = request_get(url, timeout=20, params=params)
     xml_content = r.content.decode("utf-8", errors="ignore")
     xml_content = re.sub(r'\sxmlns="[^"]+"', "", xml_content, count=1)
     root = ET.fromstring(xml_content)
@@ -216,7 +221,7 @@ def fetch_vm_data(trade_name: str, forts_rows=None):
         "iss.only": "securities",
         "securities.columns": "MINSTEP,STEPPRICE",
     }
-    spec = request_get(spec_url, timeout=20).json()
+    spec = request_get(spec_url, timeout=20, params=spec_params).json()
     minstep, stepprice = spec["securities"]["data"][0]
     multiplier = stepprice / minstep
 
@@ -226,7 +231,7 @@ def fetch_vm_data(trade_name: str, forts_rows=None):
         "iss.only": "history",
         "history.columns": "TRADEDATE,SETTLEPRICE",
     }
-    history = request_get(hist_url, timeout=20).json()
+    history = request_get(hist_url, timeout=20, params=hist_params).json()
     rows = history.get("history", {}).get("data", [])
     if len(rows) < 2:
         raise RuntimeError("Недостаточно данных для расчёта вариационной маржи")
@@ -810,7 +815,7 @@ def fetch_isins_parallel(isins, max_workers=10, show_progress=True):
                 data = {
                     "ISIN": isin,
                     "Код эмитента": "",
-                    "Наименование инструмента": "",
+                    "Наименование нструмента": "",
                     "Дата погашения": None,
                     "Дата оферты Put": None,
                     "Дата оферты Call": None,
@@ -958,7 +963,7 @@ if st.session_state["active_view"] == "vm":
                 st.session_state["forts_contracts"] = fetch_forts_securities()
             except Exception:
                 st.session_state["forts_contracts"] = []
-                st.warning("Не удалось загрузить список контрактов FORTS.")
+                st.warning("Не удалось агрузить список контрактов FORTS.")
     trade_name = st.text_input("TRADE_NAME (SHORTNAME биржи)", value="", key="vm_trade_name")
     quantity = st.number_input(
         "Кол-во (целое, неотрицательное)",
