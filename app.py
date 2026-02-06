@@ -246,6 +246,7 @@ def fetch_vm_data(trade_name: str, forts_rows=None):
         "SECID": secid,
         "TRADEDATE": datetime.today().strftime("%Y-%m-%d"),
         "PREV_PRICE": prev_price,
+        "LAST_SETTLE_PRICE": last_settle_price,
         "TODAY_PRICE": today_price,
         "MULTIPLIER": multiplier,
         "VM": vm,
@@ -633,7 +634,7 @@ def get_bond_data(isin: str):
             "Наименование инструмента": secname or "",
             "Дата погашения": fmt(maturity_date),
             "Дата оферты Put": fmt(put_date),
-            "та оферты Call": fmt(call_date),
+            "Дата оферты Call": fmt(call_date),
             "Дата фиксации купона": fmt(record_date),
             "Дата купона": fmt(coupon_date),
             "Валюта купона": coupon_currency or "",
@@ -984,7 +985,9 @@ if st.session_state["active_view"] == "vm":
                 st.markdown(f"**Инструмент:** {vm_data['TRADE_NAME']}")
                 st.markdown(f"**SECID:** {vm_data['SECID']}")
                 st.markdown(f"**Дата клиринга:** {vm_data['TRADEDATE']}")
-                st.markdown(f"**SETTLEPRICE вчера:** {vm_data['PREV_PRICE']}")
+                st.markdown(
+                    f"**Расчетная цена последнего клиринга:** {vm_data['LAST_SETTLE_PRICE']}"
+                )
                 st.markdown(f"**SETTLEPRICE сегодня:** {vm_data['TODAY_PRICE']}")
                 st.markdown(f"**Multiplier:** {vm_data['MULTIPLIER']}")
                 st.markdown(f"**Вариационная маржа за день:** {vm_data['VM']:.2f}")
@@ -1176,7 +1179,7 @@ if st.session_state["results"] is not None:
             if "Эмитент" in cols and "Код эмитента" in cols:
                 cols.remove("Эмитент")
                 idx = cols.index("Код эмитента")
-                cols.insert(idx + 1, "Эмитент")
+                cols.insert(idx + 1, "митент")
                 df_res = df_res[cols]
             st.session_state["results"] = df_res
         except Exception:
