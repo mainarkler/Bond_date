@@ -172,6 +172,28 @@ def money_decimal(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
+@st.cache_data(ttl=3600)
+def get_usd_rub_cb_today():
+    url = "https://www.cbr.ru/scripts/XML_daily.asp"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+
+    root = ET.fromstring(r.content)
+    for valute in root.findall("Valute"):
+        char_code = valute.findtext("CharCode")
+        if char_code == "USD":
+            value_str = valute.findtext("Value", "").replace(",", ".")
+            nominal_str = valute.findtext("Nominal", "1")
+            usd_rub = Decimal(value_str) / Decimal(nominal_str)
+            usd_rub = usd_rub.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            return {
+                "date": root.attrib.get("Date"),
+                "usd_rub": usd_rub,
+            }
+
+    raise RuntimeError("Не удалось получить курс USD/RUB с ЦБ")
+
+
 def fetch_vm_data(trade_name: str, forts_rows=None):
     trade_name_clean = trade_name.strip()
     trade_name_upper = trade_name_clean.upper()
@@ -897,7 +919,7 @@ if st.session_state["active_view"] == "calendar":
 
         if invalid_isins:
             st.warning(
-                "Некоректные ISIN пропущены: "
+                "Некорректные ISIN пропущены: "
                 f"{', '.join(invalid_isins[:10])}{'...' if len(invalid_isins) > 10 else ''}"
             )
         if not entries:
@@ -1007,8 +1029,11 @@ if st.session_state["active_view"] == "vm":
                 st.markdown(f"**Multiplier:** {vm_data['MULTIPLIER']}")
                 st.markdown(f"**Вариационная маржа за день:** {vm_data['VM']:.2f}")
                 st.markdown(f"**Маржа позиции (VM × Кол-во):** {position_vm:.2f}")
-                limit_sum = (0.05 * vm_data["TODAY_PRICE"] * quantity) + position_vm
+                usd_rub_data = get_usd_rub_cb_today()
+                usd_rub = float(usd_rub_data["usd_rub"])
+                limit_sum = (0.05 * vm_data["TODAY_PRICE"] * quantity * usd_rub) + position_vm
                 st.markdown(f"**Сумма отграничения:** {limit_sum:.2f}")
+                st.caption(f"USD/RUB ЦБ: {usd_rub_data['usd_rub']} на {usd_rub_data['date']}")
             except Exception as exc:
                 st.error(str(exc))
     st.stop()
