@@ -10,6 +10,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO, StringIO
 
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
 import requests
 import streamlit as st
 from requests.adapters import HTTPAdapter
@@ -50,7 +52,7 @@ if st.session_state["active_view"] != "home":
 
 if st.session_state["active_view"] == "home":
     st.subheader("🏠 Главное меню")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.markdown("### 📈 Претрейд РЕПО")
         st.caption("Анализ ISIN и ключевых дат бумаг для сделок РЕПО.")
@@ -68,6 +70,12 @@ if st.session_state["active_view"] == "home":
         st.caption("Расчет вариационной маржи по фьючерсам FORTS.")
         if st.button("Открыть", key="open_vm", use_container_width=True):
             st.session_state["active_view"] = "vm"
+            trigger_rerun()
+    with col4:
+        st.markdown("### 🔥 Матрица δP")
+        st.caption("Расчет матрицы изменения цены по объему заявок.")
+        if st.button("Открыть", key="open_delta_p", use_container_width=True):
+            st.session_state["active_view"] = "delta_p"
             trigger_rerun()
     st.stop()
 
@@ -288,6 +296,87 @@ def fetch_vm_data(trade_name: str, forts_rows=None):
         "MULTIPLIER": float(multiplier),
         "VM": float(money_decimal(vm)),
     }
+
+
+def fetch_security_history(secid: str, start_date: datetime, end_date: datetime) -> pd.DataFrame:
+    """Fetch daily history data for a security from MOEX ISS."""
+    params = {
+        "iss.meta": "off",
+        "iss.only": "history",
+        "history.columns": "TRADEDATE,HIGH,LOW,CLOSE,VOLUME",
+        "from": start_date.strftime("%Y-%m-%d"),
+        "till": end_date.strftime("%Y-%m-%d"),
+    }
+    markets = ["bonds", "shares"]
+    for market in markets:
+        url = f"https://iss.moex.com/iss/history/engines/stock/markets/{market}/securities/{secid}.json"
+        try:
+            response = request_get(url, timeout=20, params=params).json()
+        except Exception:
+            continue
+        rows = response.get("history", {}).get("data", [])
+        if rows:
+            df = pd.DataFrame(rows, columns=["date", "high", "low", "close", "volume"])
+            return df
+    return pd.DataFrame(columns=["date", "high", "low", "close", "volume"])
+
+
+def build_delta_p_matrix_from_history(
+    history_df: pd.DataFrame,
+    tau: int,
+    q_list: list[float],
+    c: float,
+) -> tuple[pd.DataFrame, float, float]:
+    """Build delta P matrix using daily high/low/close/volume history."""
+    if not 0 <= c <= 1:
+        raise ValueError("C must be in the range [0, 1].")
+    if tau <= 0:
+        raise ValueError("tau must be a positive integer.")
+
+    history_df = history_df.copy()
+    history_df["date"] = pd.to_datetime(history_df["date"])
+    history_df = history_df.sort_values("date")
+    history_df["high"] = pd.to_numeric(history_df["high"], errors="coerce")
+    history_df["low"] = pd.to_numeric(history_df["low"], errors="coerce")
+    history_df["close"] = pd.to_numeric(history_df["close"], errors="coerce")
+    history_df["volume"] = pd.to_numeric(history_df["volume"], errors="coerce")
+
+    daily_stats = history_df.dropna(subset=["high", "low", "close", "volume"])
+    if daily_stats.empty or len(daily_stats) < tau:
+        raise ValueError("Недостаточно данных для расчета за период τ.")
+
+    sigma_series = (daily_stats["high"] - daily_stats["low"]) / daily_stats["close"]
+    sigma_bar = sigma_series.tail(tau).mean()
+    mdq_tau = daily_stats["volume"].tail(tau).median()
+
+    if mdq_tau <= 0 or np.isnan(mdq_tau):
+        raise ValueError("MDQ_tau должен быть положительным.")
+    if sigma_bar <= 0 or np.isnan(sigma_bar):
+        raise ValueError("sigma_bar должен быть положительным.")
+
+    last_dates = daily_stats["date"].tail(tau)
+    q_array = np.array(q_list, dtype=float)
+    delta_p_values = c * sigma_bar * np.sqrt(q_array / mdq_tau)
+    matrix = np.tile(delta_p_values, (len(last_dates), 1))
+    delta_p_df = pd.DataFrame(matrix, index=last_dates.dt.date, columns=q_array)
+
+    return delta_p_df, sigma_bar, mdq_tau
+
+
+def plot_delta_p_heatmap(delta_p_df: pd.DataFrame, title: str) -> None:
+    """Plot delta P heatmap with days on Y axis and Q on X axis."""
+    fig, ax = plt.subplots(figsize=(12, 6))
+    heatmap = ax.imshow(delta_p_df.values, aspect="auto", cmap="viridis")
+    fig.colorbar(heatmap, ax=ax, label="δP")
+    ax.set_xticks(np.arange(len(delta_p_df.columns)))
+    ax.set_xticklabels(delta_p_df.columns, rotation=45)
+    ax.set_yticks(np.arange(len(delta_p_df.index)))
+    ax.set_yticklabels(delta_p_df.index)
+    ax.set_xlabel("Q (объем заявки)")
+    ax.set_ylabel("Дни (последние τ)")
+    ax.set_title(title)
+    fig.tight_layout()
+    st.pyplot(fig)
 
 
 # ---------------------------
@@ -530,154 +619,64 @@ def get_bond_data(isin: str):
             today = pd.to_datetime(datetime.today().date())
             possible_coupon_date_cols = [c for c in cols_upper if "COUPON" in c and "DATE" in c]
             possible_record_date_cols = [c for c in cols_upper if "RECORD" in c and "DATE" in c]
-
-            def next_future_date(series):
-                try:
-                    s = pd.to_datetime(series, errors="coerce")
-                    s = s[s >= today]
-                    if not s.empty:
-                        return s.min().strftime("%Y-%m-%d")
-                except Exception:
-                    pass
-                return None
-
-            coupon_found = None
-            for col in possible_coupon_date_cols:
-                candidate = next_future_date(df_coupons[col])
-                if candidate:
-                    coupon_found = candidate
-                    break
-            if not coupon_found:
-                all_dates = []
-                for col in df_coupons.columns:
-                    try:
-                        s = pd.to_datetime(df_coupons[col], errors="coerce")
-                        s = s[s >= today]
-                        if not s.empty:
-                            all_dates.append(s.min())
-                    except Exception:
-                        pass
-                if all_dates:
-                    coupon_found = min(all_dates).strftime("%Y-%m-%d")
-            coupon_date = coupon_found
-
-            record_found = None
-            for col in possible_record_date_cols:
-                candidate = next_future_date(df_coupons[col])
-                if candidate:
-                    record_found = candidate
-                    break
-            record_date = record_found
-
-            if bondization_faceunit:
-                coupon_currency = bondization_faceunit
-            else:
-                faceunit_cols = [c for c in df_coupons.columns if "FACEUNIT" in c or c == "FACEUNIT_S"]
-                if faceunit_cols:
-                    for c in faceunit_cols:
-                        vals = df_coupons[c].dropna().astype(str)
-                        if not vals.empty and vals.iloc[0].strip():
-                            coupon_currency = vals.iloc[0].strip()
-                            break
-
-            val_col = None
-            val_rub_col = None
-            val_prc_col = None
-            for c in df_coupons.columns:
-                uc = c.upper()
-                if uc in ("VALUE", "VALUE_COUPON", "COUPONVALUE") and not val_col:
-                    val_col = c
-                if "VALUE_RUB" in uc and not val_rub_col:
-                    val_rub_col = c
-                if uc in ("VALUEPRC", "VALUE_PRC", "VALUE%") and not val_prc_col:
-                    val_prc_col = c
-            if not val_col:
-                for c in df_coupons.columns:
-                    if re.match(r"^VALUE$", c, flags=re.IGNORECASE):
-                        val_col = c
+            for _, row in df_coupons.iterrows():
+                coupon_date_val = None
+                record_date_val = None
+                for col in possible_coupon_date_cols:
+                    dt = pd.to_datetime(row.get(col), errors="coerce")
+                    if pd.notna(dt):
+                        coupon_date_val = dt
                         break
-            if not val_rub_col:
-                for c in df_coupons.columns:
-                    if re.search(r"RUB", c, flags=re.IGNORECASE):
-                        if "VALUE" in c.upper() or "RUB" in c.upper():
-                            val_rub_col = c
-                            break
-            if not val_prc_col:
-                for c in df_coupons.columns:
-                    if re.search(r"PRC|PERC|%|PERCENT", c, flags=re.IGNORECASE):
-                        val_prc_col = c
+                for col in possible_record_date_cols:
+                    dt = pd.to_datetime(row.get(col), errors="coerce")
+                    if pd.notna(dt):
+                        record_date_val = dt
                         break
+                if coupon_date_val is None:
+                    continue
+                if coupon_date is None or coupon_date_val >= today:
+                    coupon_date = coupon_date_val.strftime("%Y-%m-%d")
+                if record_date_val is not None:
+                    if record_date is None or record_date_val >= today:
+                        record_date = record_date_val.strftime("%Y-%m-%d")
 
-            chosen_row = None
-            if coupon_date:
-                for c in possible_coupon_date_cols:
-                    try:
-                        mask = pd.to_datetime(df_coupons[c], errors="coerce").dt.strftime("%Y-%m-%d") == coupon_date
-                        rows = df_coupons[mask]
-                        if not rows.empty:
-                            chosen_row = rows.iloc[0]
-                            break
-                    except Exception:
-                        pass
-            if chosen_row is None:
-                for idx in range(len(df_coupons)):
-                    row = df_coupons.iloc[idx]
-                    has_val = False
-                    for colcheck in (val_col, val_rub_col, val_prc_col):
-                        try:
-                            if colcheck and pd.notnull(row.get(colcheck)):
-                                has_val = True
-                                break
-                        except Exception:
-                            pass
-                    if has_val:
-                        chosen_row = row
-                        break
+            coupon_currency = df_coupons.get("FACEUNIT")
+            if coupon_currency is not None:
+                coupon_currency = coupon_currency.dropna().unique()
+                if len(coupon_currency) > 0:
+                    coupon_currency = str(coupon_currency[0])
 
-            def norm_str(v):
-                if v is None or (isinstance(v, float) and math.isnan(v)):
-                    return None
-                try:
-                    return str(v)
-                except Exception:
-                    return None
+            coupon_value = df_coupons.get("VALUE")
+            if coupon_value is not None:
+                coupon_value = coupon_value.dropna().unique()
+                if len(coupon_value) > 0:
+                    coupon_value = parse_number(coupon_value[0])
 
-            if chosen_row is not None:
-                coupon_value = norm_str(chosen_row.get(val_col)) if val_col else None
-                coupon_value_rub = norm_str(chosen_row.get(val_rub_col)) if val_rub_col else None
-                coupon_value_prc = norm_str(chosen_row.get(val_prc_col)) if val_prc_col else None
+            coupon_value_rub = df_coupons.get("VALUE_RUB")
+            if coupon_value_rub is not None:
+                coupon_value_rub = coupon_value_rub.dropna().unique()
+                if len(coupon_value_rub) > 0:
+                    coupon_value_rub = parse_number(coupon_value_rub[0])
 
-        if (not record_date or not coupon_date or not coupon_currency) and (TQOB_MAP or TQCB_MAP):
-            mapping = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
-            if mapping:
-                if not record_date:
-                    record_date = mapping.get("RECORDDATE") or mapping.get("RECORD_DATE") or mapping.get("RECORD")
-                if not coupon_date:
-                    coupon_date = mapping.get("COUPONDATE") or mapping.get("COUPON_DATE") or mapping.get("COUPON")
-                if not coupon_currency:
-                    coupon_currency = mapping.get("FACEUNIT") or mapping.get("FACEUNIT_S") or mapping.get("FACEUNIT")
-
-        def fmt(date):
-            if pd.isna(date) or not date:
-                return None
-            try:
-                return pd.to_datetime(date).strftime("%Y-%m-%d")
-            except Exception:
-                return None
+            coupon_value_prc = df_coupons.get("VALUE_PRCT")
+            if coupon_value_prc is not None:
+                coupon_value_prc = coupon_value_prc.dropna().unique()
+                if len(coupon_value_prc) > 0:
+                    coupon_value_prc = parse_number(coupon_value_prc[0])
 
         return {
             "ISIN": isin,
             "Код эмитента": emitter_id or "",
             "Наименование инструмента": secname or "",
-            "Дата погашения": fmt(maturity_date),
-            "Дата оферты Put": fmt(put_date),
-            "Дата оферты Call": fmt(call_date),
-            "Дата фиксации купона": fmt(record_date),
-            "Дата купона": fmt(coupon_date),
-            "Валюта купона": coupon_currency or "",
-            "Купон в валюте": coupon_value or "",
-            "Купон в Руб": coupon_value_rub or "",
-            "Купон %": coupon_value_prc or "",
+            "Дата погашения": maturity_date,
+            "Дата оферты Put": put_date,
+            "Дата оферты Call": call_date,
+            "Дата фиксации купона": record_date,
+            "Дата купона": coupon_date,
+            "Валюта купона": coupon_currency,
+            "Купон в валюте": coupon_value,
+            "Купон в Руб": coupon_value_rub,
+            "Купон %": coupon_value_prc,
         }
     except Exception:
         return {
@@ -697,49 +696,44 @@ def get_bond_data(isin: str):
 
 
 # ---------------------------
-# Calendar helpers
+# Fetch bond schedule for calendar
 # ---------------------------
 @st.cache_data(ttl=3600)
 def get_bond_schedule(isin: str):
     isin = str(isin).strip().upper()
     emitter_id, secid = fetch_emitter_and_secid(isin)
-    maturity_date = put_date = call_date = None
+    secname = maturity_date = put_date = call_date = None
     coupon_events = {}
     facevalue = None
+    if not secid:
+        return {
+            "ISIN": isin,
+            "Код эмитента": emitter_id or "",
+            "Дата погашения": None,
+            "Дата оферты Put": None,
+            "Дата оферты Call": None,
+            "Купоны": {},
+            "Номинал": None,
+        }
 
-    if secid:
-        try:
-            url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
-            r = request_get(url_info, timeout=10)
-            data_info = r.json()
-            rows_info = data_info.get("securities", {}).get("data", [])
-            cols_info = data_info.get("securities", {}).get("columns", [])
-            if rows_info and cols_info:
-                info = dict(zip([c.upper() for c in cols_info], rows_info[0]))
-                maturity_date = info.get("MATDATE") or maturity_date
-                put_date = info.get("PUTOPTIONDATE") or put_date
-                call_date = info.get("CALLOPTIONDATE") or call_date
-                if facevalue is None:
-                    facevalue = parse_number(info.get("FACEVALUE") or info.get("FACEVALUE_RUB"))
-        except Exception:
-            pass
+    url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
+    try:
+        r = request_get(url_info, timeout=10)
+        data_info = r.json()
+        rows_info = data_info.get("securities", {}).get("data", [])
+        cols_info = data_info.get("securities", {}).get("columns", [])
+        if rows_info and cols_info:
+            info = dict(zip([c.upper() for c in cols_info], rows_info[0]))
+            secname = info.get("SECNAME") or info.get("SEC_NAME") or secname
+            maturity_date = info.get("MATDATE") or maturity_date
+            put_date = info.get("PUTOPTIONDATE") or put_date
+            call_date = info.get("CALLOPTIONDATE") or call_date
+    except Exception:
+        pass
 
-    if not maturity_date:
-        try:
-            url_info_isin = f"https://iss.moex.com/iss/securities/{isin}.json"
-            r = request_get(url_info_isin, timeout=10)
-            data_info_isin = r.json()
-            rows = data_info_isin.get("securities", {}).get("data", [])
-            cols = data_info_isin.get("securities", {}).get("columns", [])
-            if rows and cols:
-                info = dict(zip([c.upper() for c in cols], rows[0]))
-                maturity_date = maturity_date or info.get("MATDATE")
-                put_date = put_date or info.get("PUTOPTIONDATE") or info.get("PUT_OPTION_DATE")
-                call_date = call_date or info.get("CALLOPTIONDATE") or info.get("CALL_OPTION_DATE")
-                if facevalue is None:
-                    facevalue = parse_number(info.get("FACEVALUE") or info.get("FACEVALUE_RUB"))
-        except Exception:
-            pass
+    coupons_data = None
+    columns_coupons = []
+    bond_info = None
 
     def try_fetch_bondization(identifier: str):
         try:
@@ -753,19 +747,16 @@ def get_bond_schedule(isin: str):
             cols = data.get("coupons", {}).get("columns", [])
             bond_rows = data.get("bondization", {}).get("data", [])
             bond_cols = data.get("bondization", {}).get("columns", [])
-            bond_info = None
+            info = None
             if bond_rows and bond_cols:
-                bond_info = dict(zip([c.upper() for c in bond_cols], bond_rows[0]))
-            return coupons, cols, bond_info
+                info = dict(zip([c.upper() for c in bond_cols], bond_rows[0]))
+            return coupons, cols, info
         except Exception:
             return None, [], None
 
-    coupons_data = columns_coupons = None
-    bond_info = None
-    if secid:
-        coupons_data, columns_coupons, bond_info = try_fetch_bondization(secid)
+    coupons_data, columns_coupons, bond_info = try_fetch_bondization(secid)
 
-    if isin and (not coupons_data or not columns_coupons):
+    if not coupons_data or not columns_coupons:
         coupons_data_fallback, columns_coupons_fallback, bond_info_fallback = try_fetch_bondization(isin)
         if coupons_data_fallback and columns_coupons_fallback:
             coupons_data = coupons_data_fallback
@@ -1036,6 +1027,82 @@ if st.session_state["active_view"] == "vm":
                 st.caption(f"USD/RUB: {usd_rub_data['usd_rub']} на {usd_rub_data['date']}")
             except Exception as exc:
                 st.error(str(exc))
+    st.stop()
+
+# ---------------------------
+# Delta P matrix view
+# ---------------------------
+if st.session_state["active_view"] == "delta_p":
+    st.subheader("🔥 Матрица δP")
+    st.markdown(
+        "Введите список ISIN для расчета матрицы изменения цены δP. "
+        "Дата задается один раз для всех бумаг."
+    )
+
+    calc_date = st.date_input("Дата расчета (общая для всех бумаг)", value=datetime.today().date())
+    tau_days = st.number_input("Период τ (дней)", min_value=2, max_value=60, value=10, step=1)
+    c_const = st.slider("Константа C", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
+
+    q_points = st.number_input("Количество значений Q", min_value=3, max_value=30, value=10, step=1)
+    q_max = st.number_input("Максимальный Q (до 10 000 000)", min_value=1, max_value=10_000_000, value=1_000_000)
+    q_list = np.linspace(1, q_max, int(q_points))
+
+    isin_input = st.text_area(
+        "ISIN (каждый с новой строки или через пробел/запятую)",
+        height=200,
+        placeholder="RU000A0JX0J2\nRU000A0ZZZY1",
+        key="delta_p_isin_input",
+    )
+
+    if st.button("Рассчитать матрицы δP", key="delta_p_calculate"):
+        raw_isins = [i.strip().upper() for i in re.split(r"[\s,;]+", isin_input) if i.strip()]
+        unique_isins = list(dict.fromkeys(raw_isins))
+
+        if not unique_isins:
+            st.error("Введите хотя бы один ISIN.")
+            st.stop()
+
+        invalid_isins = [i for i in unique_isins if not isin_format_valid(i)]
+        if invalid_isins:
+            st.warning(
+                "Некорректные ISIN по формату пропущены: "
+                f"{', '.join(invalid_isins[:10])}{'...' if len(invalid_isins) > 10 else ''}"
+            )
+        isins = [i for i in unique_isins if isin_format_valid(i)]
+        if not isins:
+            st.error("Нет валидных ISIN для расчета.")
+            st.stop()
+
+        start_date = datetime.combine(calc_date, datetime.min.time()) - timedelta(days=tau_days * 3)
+        end_date = datetime.combine(calc_date, datetime.min.time())
+
+        for isin in isins:
+            with st.spinner(f"Загружаем историю для {isin}..."):
+                emitter_id, secid = fetch_emitter_and_secid(isin)
+                if not secid:
+                    st.warning(f"{isin}: SECID не найден.")
+                    continue
+
+                history_df = fetch_security_history(secid, start_date, end_date)
+                if history_df.empty:
+                    st.warning(f"{isin}: история торгов не найдена.")
+                    continue
+
+            try:
+                delta_p_df, sigma_bar, mdq_tau = build_delta_p_matrix_from_history(
+                    history_df,
+                    tau=int(tau_days),
+                    q_list=q_list.tolist(),
+                    c=float(c_const),
+                )
+            except Exception as exc:
+                st.error(f"{isin}: {exc}")
+                continue
+
+            st.markdown(f"#### {isin}")
+            st.caption(f"SECID: {secid} | sigmā: {sigma_bar:.6f} | MDQτ: {mdq_tau:.2f}")
+            plot_delta_p_heatmap(delta_p_df, title=f"Матрица δP для {isin}")
+            st.dataframe(delta_p_df, use_container_width=True)
     st.stop()
 
 # ---------------------------
