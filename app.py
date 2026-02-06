@@ -126,7 +126,7 @@ def extract_secid_shortname(row):
 @st.cache_data(ttl=3600)
 def fetch_forts_securities():
     url = "https://iss.moex.com/iss/engines/futures/markets/forts/securities.xml"
-    r = request_get(f"{url}?iss.meta=off&iss.only=securities&securities.columns=SECID,SHORTNAME", timeout=20)
+    r = request_get(f"{url}?iss.meta=off&iss.only=securities&securities.columns=SECID,SHORTNAME")
     xml_content = r.content.decode("utf-8", errors="ignore")
     xml_content = re.sub(r'\sxmlns="[^"]+"', "", xml_content, count=1)
     root = ET.fromstring(xml_content)
