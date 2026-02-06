@@ -57,7 +57,7 @@ if st.session_state["active_view"] == "home":
             st.session_state["active_view"] = "repo"
             trigger_rerun()
     with col2:
-        st.markdown("### 📅 Календарь вплат")
+        st.markdown("### 📅 Календарь выплат")
         st.caption("Загрузка портфеля и построение календаря купонов и погашений.")
         if st.button("Открыть", key="open_calendar", use_container_width=True):
             st.session_state["active_view"] = "calendar"
@@ -219,10 +219,10 @@ def fetch_vm_data(trade_name: str, forts_rows=None):
     spec_params = {
         "iss.meta": "off",
         "iss.only": "securities",
-        "securities.columns": "MINSTEP,STEPPRICE",
+        "securities.columns": "MINSTEP,STEPPRICE,LASTSETTLEPRICE",
     }
     spec = request_get(spec_url, timeout=20, params=spec_params).json()
-    minstep, stepprice = spec["securities"]["data"][0]
+    minstep, stepprice, last_settle_price = spec["securities"]["data"][0]
     multiplier = stepprice / minstep
 
     hist_url = f"https://iss.moex.com/iss/history/engines/futures/markets/forts/securities/{secid}.json"
@@ -237,13 +237,14 @@ def fetch_vm_data(trade_name: str, forts_rows=None):
         raise RuntimeError("Недостаточно данных для расчёта вариационной маржи")
 
     prev_date, prev_price = rows[-2]
-    today_date, today_price = rows[-1]
+    today_date, history_today_price = rows[-1]
+    today_price = last_settle_price if last_settle_price is not None else history_today_price
     vm = (today_price - prev_price) * multiplier
 
     return {
         "TRADE_NAME": trade_name_clean,
         "SECID": secid,
-        "TRADEDATE": today_date,
+        "TRADEDATE": datetime.today().strftime("%Y-%m-%d"),
         "PREV_PRICE": prev_price,
         "TODAY_PRICE": today_price,
         "MULTIPLIER": multiplier,
@@ -632,7 +633,7 @@ def get_bond_data(isin: str):
             "Наименование инструмента": secname or "",
             "Дата погашения": fmt(maturity_date),
             "Дата оферты Put": fmt(put_date),
-            "Дата оферты Call": fmt(call_date),
+            "та оферты Call": fmt(call_date),
             "Дата фиксации купона": fmt(record_date),
             "Дата купона": fmt(coupon_date),
             "Валюта купона": coupon_currency or "",
@@ -815,7 +816,7 @@ def fetch_isins_parallel(isins, max_workers=10, show_progress=True):
                 data = {
                     "ISIN": isin,
                     "Код эмитента": "",
-                    "Наименование нструмента": "",
+                    "Наименование инструмента": "",
                     "Дата погашения": None,
                     "Дата оферты Put": None,
                     "Дата оферты Call": None,
@@ -963,7 +964,7 @@ if st.session_state["active_view"] == "vm":
                 st.session_state["forts_contracts"] = fetch_forts_securities()
             except Exception:
                 st.session_state["forts_contracts"] = []
-                st.warning("Не удалось агрузить список контрактов FORTS.")
+                st.warning("Не удалось загрузить список контрактов FORTS.")
     trade_name = st.text_input("TRADE_NAME (SHORTNAME биржи)", value="", key="vm_trade_name")
     quantity = st.number_input(
         "Кол-во (целое, неотрицательное)",
@@ -988,6 +989,8 @@ if st.session_state["active_view"] == "vm":
                 st.markdown(f"**Multiplier:** {vm_data['MULTIPLIER']}")
                 st.markdown(f"**Вариационная маржа за день:** {vm_data['VM']:.2f}")
                 st.markdown(f"**Маржа позиции (VM × Кол-во):** {position_vm:.2f}")
+                limit_sum = (0.05 * vm_data["TODAY_PRICE"] * quantity) + position_vm
+                st.markdown(f"**Сумма отграничения:** {limit_sum:.2f}")
             except Exception as exc:
                 st.error(str(exc))
     st.stop()
