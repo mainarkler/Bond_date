@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-"""Copy-ready Streamlit app (single-file)."""
 import csv
 import math
 import re
@@ -264,7 +262,7 @@ def calculate_bond_delta_p(
     date_to: str,
     q_mode: str,
     q_max: int,
-    q_points: int,
+    q_points: int = 50,
 ) -> tuple[pd.DataFrame, dict]:
     df_hist = load_bond_history(secid)
     df_yield = load_bond_yield_data(secid)
@@ -312,13 +310,7 @@ def calculate_bond_delta_p(
     delta_p = dmod * price * delta_y
     delta_p_pct = delta_p / price
 
-    result = pd.DataFrame(
-        {
-            "Q": q_vec,
-            "DeltaP": delta_p,
-            "DeltaP_pct": delta_p_pct,
-        }
-    )
+    result = pd.DataFrame({"Q": q_vec, "DeltaP_pct": delta_p_pct})
     meta = {
         "ISIN": secid,
         "T": t_len,
@@ -1440,11 +1432,6 @@ if st.session_state["active_view"] == "sell_stres":
             value=datetime(2023, 1, 1).date(),
             key="bond_date_from",
         )
-        bond_date_to = st.date_input(
-            "Дата окончания (data_to)",
-            value=datetime.now().date() - timedelta(days=1),
-            key="bond_date_to",
-        )
         bond_q_max = st.number_input(
             "Q_MAX (макс. объём продажи)",
             min_value=1,
@@ -1453,14 +1440,6 @@ if st.session_state["active_view"] == "sell_stres":
             format="%d",
             key="bond_q_max",
             disabled=use_q_from_list_bond,
-        )
-        bond_q_points = st.number_input(
-            "Q_POINTS (кол-во точек)",
-            min_value=1,
-            value=50,
-            step=1,
-            format="%d",
-            key="bond_q_points",
         )
         bond_use_log = st.checkbox(
             "Логарифмическое приближение", value=False, key="bond_q_log"
@@ -1515,10 +1494,9 @@ if st.session_state["active_view"] == "sell_stres":
                                 secid=isin,
                                 c_value=float(bond_c_value),
                                 date_from=bond_date_from.strftime("%Y-%m-%d"),
-                                date_to=bond_date_to.strftime("%Y-%m-%d"),
+                                date_to=(datetime.now().date() - timedelta(days=1)).strftime("%Y-%m-%d"),
                                 q_mode=bond_q_mode,
                                 q_max=entry["Q_MAX"],
-                                q_points=int(bond_q_points),
                             )
                             results[isin] = delta_df
                             meta_rows.append(meta)
