@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+"""Copy-ready Streamlit app (single-file)."""
 import csv
 import math
 import re
@@ -9,6 +10,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO, StringIO
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -50,24 +52,31 @@ if st.session_state["active_view"] != "home":
 
 if st.session_state["active_view"] == "home":
     st.subheader("🏠 Главное меню")
-    col1, col2, col3 = st.columns(3)
-    with col1:
+    top_left, top_right = st.columns(2)
+    with top_left:
         st.markdown("### 📈 Претрейд РЕПО")
         st.caption("Анализ ISIN и ключевых дат бумаг для сделок РЕПО.")
         if st.button("Открыть", key="open_repo", use_container_width=True):
             st.session_state["active_view"] = "repo"
             trigger_rerun()
-    with col2:
+    with top_right:
         st.markdown("### 📅 Календарь выплат")
         st.caption("Загрузка портфеля и построение календаря купонов и погашений.")
         if st.button("Открыть", key="open_calendar", use_container_width=True):
             st.session_state["active_view"] = "calendar"
             trigger_rerun()
-    with col3:
+    bottom_left, bottom_right = st.columns(2)
+    with bottom_left:
         st.markdown("### 🧮 Расчет VM")
         st.caption("Расчет вариационной маржи по фьючерсам FORTS.")
         if st.button("Открыть", key="open_vm", use_container_width=True):
             st.session_state["active_view"] = "vm"
+            trigger_rerun()
+    with bottom_right:
+        st.markdown("### 🧩 Sell_stres")
+        st.caption("Оценка рыночного давления для акций и облигаций.")
+        if st.button("Открыть", key="open_sell_stres", use_container_width=True):
+            st.session_state["active_view"] = "sell_stres"
             trigger_rerun()
     st.stop()
 
@@ -96,6 +105,107 @@ def request_get(url: str, timeout: int = 15, params=None):
     response = HTTP_SESSION.get(url, timeout=timeout, params=params)
     response.raise_for_status()
     return response
+
+
+# ---------------------------
+# Sell_stres helpers (Share)
+# ---------------------------
+BASE_HISTORY_URL = (
+    "https://iss.moex.com/iss/history/engines/stock/markets/shares/securities"
+)
+
+
+def isin_to_secid(isin: str) -> str:
+    params = {"q": isin, "iss.meta": "off"}
+    response = request_get("https://iss.moex.com/iss/securities.json", params=params, timeout=20)
+    js = response.json()
+    df = pd.DataFrame(js["securities"]["data"], columns=js["securities"]["columns"])
+    df = df[df["isin"] == isin]
+    if df.empty:
+        raise ValueError(f"ISIN {isin} не найден на MOEX")
+    return df["secid"].iloc[0]
+
+
+def load_moex_history(secid: str) -> pd.DataFrame:
+    start = 0
+    all_rows = []
+    while True:
+        url = f"{BASE_HISTORY_URL}/{secid}.json"
+        response = request_get(url, params={"start": start}, timeout=20)
+        js = response.json()
+        rows = js["history"]["data"]
+        cols = js["history"]["columns"]
+        if not rows:
+            break
+        all_rows.extend(rows)
+        start += len(rows)
+    return pd.DataFrame(all_rows, columns=cols)
+
+
+def build_q_vector(mode: str, q_max: int, q_step: int = 10_000, q_points: int = 200) -> np.ndarray:
+    q_max = int(q_max)
+    if q_max <= 0:
+        raise ValueError("Q должен быть положительным")
+    if mode == "linear":
+        return np.arange(1, q_max + q_step, q_step, dtype=np.int64)
+    if mode == "log":
+        q = np.logspace(0, np.log10(q_max), q_points)
+        return np.unique(np.round(q).astype(np.int64))
+    raise ValueError("Режим Q должен быть 'linear' или 'log'")
+
+
+def calculate_share_delta_p(
+    isin: str,
+    c_value: float,
+    date_from: str,
+    q_values: np.ndarray,
+) -> tuple[pd.DataFrame, dict]:
+    secid = isin_to_secid(isin)
+    df = load_moex_history(secid)
+    df = df[["TRADEDATE", "SECID", "HIGH", "LOW", "CLOSE", "VALUE"]].copy()
+    df["TRADEDATE"] = pd.to_datetime(df["TRADEDATE"])
+    num_cols = ["HIGH", "LOW", "CLOSE", "VALUE"]
+    df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
+
+    date_from_dt = pd.to_datetime(date_from)
+    date_to_dt = pd.to_datetime(datetime.now().date() - timedelta(days=1))
+    df = df[(df["TRADEDATE"] >= date_from_dt) & (df["TRADEDATE"] <= date_to_dt)].dropna(
+        subset=num_cols
+    )
+    if df.empty:
+        raise ValueError("Нет данных после фильтрации по датам")
+
+    df_day = (
+        df.groupby(["TRADEDATE", "SECID"], as_index=False)
+        .agg(
+            HIGH=("HIGH", "mean"),
+            LOW=("LOW", "mean"),
+            CLOSE=("CLOSE", "mean"),
+            VALUE=("VALUE", "sum"),
+        )
+        .sort_values("TRADEDATE")
+    )
+    t_len = len(df_day)
+    if t_len == 0:
+        raise ValueError("Пустой период наблюдений")
+
+    sigma = np.sqrt(((df_day["HIGH"] - df_day["LOW"]) / df_day["CLOSE"]).sum() / t_len)
+    if not np.isfinite(sigma) or sigma <= 0:
+        raise ValueError(f"Некорректное σ = {sigma}")
+
+    mdtv = np.median(df_day["VALUE"])
+    if not np.isfinite(mdtv) or mdtv <= 0:
+        raise ValueError(f"Некорректный MDTV = {mdtv}")
+
+    delta_p = c_value * sigma * np.sqrt(q_values / mdtv)
+    result = pd.DataFrame({"Q": q_values, "DeltaP": delta_p})
+    meta = {
+        "ISIN": isin,
+        "T": t_len,
+        "Sigma": float(sigma),
+        "MDTV": float(mdtv),
+    }
+    return result, meta
 
 
 def parse_number(value):
@@ -1036,6 +1146,147 @@ if st.session_state["active_view"] == "vm":
                 st.caption(f"USD/RUB: {usd_rub_data['usd_rub']} на {usd_rub_data['date']}")
             except Exception as exc:
                 st.error(str(exc))
+    st.stop()
+
+# ---------------------------
+# Sell_stres view
+# ---------------------------
+if st.session_state["active_view"] == "sell_stres":
+    st.subheader("🧩 Sell_stres")
+    share_tab, bond_tab = st.tabs(["Share", "Bond"])
+
+    with share_tab:
+        st.markdown("### Share")
+        use_q_from_list = st.checkbox(
+            "Вводить Q для каждого ISIN (формат: ISIN | Q)", value=False, key="share_q_per_isin"
+        )
+        if use_q_from_list:
+            isin_q_input = st.text_area(
+                "Введите ISIN и Q (каждая строка: ISIN | Q)",
+                height=160,
+                placeholder="RU0009029540 | 33000000000\nRU000A0JX0J2 | 25000000000",
+                key="share_isin_q_input",
+            )
+        else:
+            isin_input = st.text_area(
+                "Введите или вставьте ISIN (через Ctrl+V, пробел или запятую)",
+                height=160,
+                placeholder="RU0009029540\nRU000A0JX0J2",
+                key="share_isin_input",
+            )
+
+        c_value = st.number_input(
+            "C (коэффициент, 0–1)",
+            min_value=0.0,
+            max_value=1.0,
+            value=1.0,
+            step=0.05,
+            format="%.2f",
+            key="share_c_value",
+        )
+        data_from = st.date_input(
+            "Дата начала (data_from)",
+            value=datetime(2024, 1, 1).date(),
+            key="share_date_from",
+        )
+        q_max = st.number_input(
+            "Q (максимум для построения вектора)",
+            min_value=1,
+            value=33_000_000_000,
+            step=1_000_000,
+            format="%d",
+            key="share_q_max",
+            disabled=use_q_from_list,
+        )
+        use_log = st.checkbox("Логарифмическое приближение", value=True, key="share_q_log")
+        q_mode = "log" if use_log else "linear"
+
+        if st.button("Рассчитать Sell_stres (Share)", key="share_calculate"):
+            entries = []
+            invalid_isins = []
+            if use_q_from_list:
+                raw_lines = [line.strip() for line in isin_q_input.splitlines() if line.strip()]
+                for line in raw_lines:
+                    parts = [p.strip() for p in re.split(r"[|;\t,]+", line) if p.strip()]
+                    if not parts:
+                        continue
+                    isin = parts[0].upper()
+                    q_val = parse_number(parts[1]) if len(parts) > 1 else None
+                    if not isin_format_valid(isin):
+                        invalid_isins.append(isin)
+                        continue
+                    if q_val is None or q_val <= 0:
+                        st.warning(f"Некорректный Q для {isin}: {parts[1] if len(parts) > 1 else ''}")
+                        continue
+                    entries.append({"ISIN": isin, "Q_MAX": int(q_val)})
+            else:
+                raw_text = isin_input.strip()
+                if raw_text:
+                    isins = re.split(r"[\s,;]+", raw_text)
+                    isins = [i.strip().upper() for i in isins if i.strip()]
+                    for isin in isins:
+                        if not isin_format_valid(isin):
+                            invalid_isins.append(isin)
+                            continue
+                        entries.append({"ISIN": isin, "Q_MAX": int(q_max)})
+
+            if invalid_isins:
+                st.warning(
+                    "Некорректные по формату ISIN пропущены: "
+                    f"{', '.join(invalid_isins[:10])}{'...' if len(invalid_isins) > 10 else ''}"
+                )
+            if not entries:
+                st.error("Нет валидных ISIN для обработки.")
+            else:
+                meta_rows = []
+                results = {}
+                progress_bar = st.progress(0.0)
+                with st.spinner("Рассчитываем Sell_stres..."):
+                    for idx, entry in enumerate(entries, start=1):
+                        isin = entry["ISIN"]
+                        try:
+                            q_vector = build_q_vector(q_mode, entry["Q_MAX"])
+                            delta_df, meta = calculate_share_delta_p(
+                                isin=isin,
+                                c_value=float(c_value),
+                                date_from=data_from.strftime("%Y-%m-%d"),
+                                q_values=q_vector,
+                            )
+                            results[isin] = delta_df
+                            meta_rows.append(meta)
+                        except Exception as exc:
+                            st.error(f"{isin}: {exc}")
+                        progress_bar.progress(idx / len(entries))
+
+                if results:
+                    st.markdown("#### Результаты ΔP")
+                    for isin, df_delta in results.items():
+                        st.markdown(f"**{isin}**")
+                        st.dataframe(df_delta, use_container_width=True)
+                        csv_bytes = df_delta.to_csv(index=False).encode("utf-8-sig")
+                        st.download_button(
+                            label=f"💾 Скачать ΔP CSV ({isin})",
+                            data=csv_bytes,
+                            file_name=f"{isin}_deltaP.csv",
+                            mime="text/csv",
+                        )
+
+                if meta_rows:
+                    meta_df = pd.DataFrame(meta_rows, columns=["ISIN", "T", "Sigma", "MDTV"])
+                    st.markdown("#### Meta_mod")
+                    st.dataframe(meta_df, use_container_width=True)
+                    meta_bytes = meta_df.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        label="💾 Скачать Meta_mod CSV",
+                        data=meta_bytes,
+                        file_name="Meta_mod.csv",
+                        mime="text/csv",
+                    )
+
+    with bond_tab:
+        st.markdown("### Bond")
+        st.info("Раздел Bond в разработке.")
+
     st.stop()
 
 # ---------------------------
