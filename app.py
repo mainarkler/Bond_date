@@ -275,7 +275,7 @@ def load_bond_yielddata(secid: str) -> pd.DataFrame:
     return df
 
 
-def calculate_bond_delta_p(isin: str, c_value: float, q_value: float) -> dict:
+def calculate_bond_delta_p(isin: str, c_value: float, q_value: float, date_from: str) -> dict:
     secid = isin_to_secid(isin)
     df_hist = load_bond_history(secid)
     df_md = load_bond_marketdata(secid)
@@ -294,9 +294,13 @@ def calculate_bond_delta_p(isin: str, c_value: float, q_value: float) -> dict:
 
     df_hist = df_hist[required_cols].copy()
     df_hist["TRADEDATE"] = pd.to_datetime(df_hist["TRADEDATE"])
+    date_from_dt = pd.to_datetime(date_from)
+    date_to_dt = pd.to_datetime(datetime.now().date() - timedelta(days=1))
     num_cols = ["HIGH", "LOW", "CLOSE", "VALUE"]
     df_hist[num_cols] = df_hist[num_cols].apply(pd.to_numeric, errors="coerce")
-    df_hist = df_hist.dropna(subset=num_cols)
+    df_hist = df_hist[
+        (df_hist["TRADEDATE"] >= date_from_dt) & (df_hist["TRADEDATE"] <= date_to_dt)
+    ].dropna(subset=num_cols)
     t_len = len(df_hist)
     if t_len == 0:
         raise ValueError("Недостаточно данных для расчета σy.")
@@ -1277,7 +1281,7 @@ if st.session_state["active_view"] == "sell_stres":
     with share_tab:
         st.markdown("### Share")
         use_q_from_list = st.checkbox(
-            "Вводить Q для каждого ISIN (формат: ISIN | Q)", value=False, key="share_q_per_isin"
+            "Вводить Q для каждго ISIN (формат: ISIN | Q)", value=False, key="share_q_per_isin"
         )
         if use_q_from_list:
             isin_q_input = st.text_area(
@@ -1433,14 +1437,27 @@ if st.session_state["active_view"] == "sell_stres":
             format="%.2f",
             key="bond_c_value",
         )
-        q_value = st.number_input(
-            "Q",
+        q_max = st.number_input(
+            "Q (максимум для построения вектора)",
             min_value=1,
             value=10_000_000,
             step=100_000,
             format="%d",
-            key="bond_q_value",
+            key="bond_q_max",
             disabled=use_q_from_list,
+        )
+        q_step = st.number_input(
+            "Шаг Q",
+            min_value=1,
+            value=100_000,
+            step=10_000,
+            format="%d",
+            key="bond_q_step",
+        )
+        bond_date_from = st.date_input(
+            "Дата начала (data_from)",
+            value=datetime(2024, 1, 1).date(),
+            key="bond_date_from",
         )
 
         if st.button("Рассчитать Sell_stres (Bond)", key="bond_calculate"):
@@ -1460,7 +1477,7 @@ if st.session_state["active_view"] == "sell_stres":
                     if q_val is None or q_val <= 0:
                         st.warning(f"Некорректный Q для {isin}: {parts[1] if len(parts) > 1 else ''}")
                         continue
-                    entries.append({"ISIN": isin, "Q_VALUE": float(q_val)})
+                    entries.append({"ISIN": isin, "Q_MAX": int(q_val)})
             else:
                 raw_text = isin_input.strip()
                 if raw_text:
@@ -1470,7 +1487,7 @@ if st.session_state["active_view"] == "sell_stres":
                         if not isin_format_valid(isin):
                             invalid_isins.append(isin)
                             continue
-                        entries.append({"ISIN": isin, "Q_VALUE": float(q_value)})
+                        entries.append({"ISIN": isin, "Q_MAX": int(q_max)})
 
             if invalid_isins:
                 st.warning(
@@ -1480,35 +1497,43 @@ if st.session_state["active_view"] == "sell_stres":
             if not entries:
                 st.error("Нет валидных ISIN для обработки.")
             else:
-                results = []
+                results = {}
                 progress_bar = st.progress(0.0)
                 with st.spinner("Рассчитываем Sell_stres (Bond)..."):
                     for idx, entry in enumerate(entries, start=1):
                         isin = entry["ISIN"]
                         try:
-                            result = calculate_bond_delta_p(
-                                isin=isin,
-                                c_value=float(c_value),
-                                q_value=float(entry["Q_VALUE"]),
+                            q_vector = build_q_vector(
+                                "linear", entry["Q_MAX"], q_step=int(q_step)
                             )
-                            result["ISIN"] = isin
-                            result["Q"] = float(entry["Q_VALUE"])
-                            results.append(result)
+                            rows = []
+                            for q_val in q_vector:
+                                result = calculate_bond_delta_p(
+                                    isin=isin,
+                                    c_value=float(c_value),
+                                    q_value=float(q_val),
+                                    date_from=bond_date_from.strftime("%Y-%m-%d"),
+                                )
+                                result["ISIN"] = isin
+                                result["Q"] = float(q_val)
+                                rows.append(result)
+                            results[isin] = pd.DataFrame(rows)
                         except Exception as exc:
                             st.error(f"{isin}: {exc}")
                         progress_bar.progress(idx / len(entries))
 
                 if results:
-                    results_df = pd.DataFrame(results)
                     st.markdown("#### Результаты ΔP (Bond)")
-                    st.dataframe(results_df, use_container_width=True)
-                    csv_bytes = results_df.to_csv(index=False).encode("utf-8-sig")
-                    st.download_button(
-                        label="💾 Скачать ΔP CSV (Bond)",
-                        data=csv_bytes,
-                        file_name="bond_deltaP.csv",
-                        mime="text/csv",
-                    )
+                    for isin, df_delta in results.items():
+                        st.markdown(f"**{isin}**")
+                        st.dataframe(df_delta, use_container_width=True)
+                        csv_bytes = df_delta.to_csv(index=False).encode("utf-8-sig")
+                        st.download_button(
+                            label=f"💾 Скачать ΔP CSV ({isin})",
+                            data=csv_bytes,
+                            file_name=f"{isin}_bond_deltaP.csv",
+                            mime="text/csv",
+                        )
 
     st.stop()
 
