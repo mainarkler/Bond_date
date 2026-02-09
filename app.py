@@ -309,12 +309,6 @@ def calculate_bond_delta_p(isin: str, c_value: float, q_value: float) -> dict:
     delta_y = c_value * sigma_y * np.sqrt(q_value / mdtv)
 
     effective_yield = df_yield["EFFECTIVEYIELDWAPRICE"].iloc[-1]
-    if pd.isna(effective_yield):
-        raise ValueError("Нет значения EFFECTIVEYIELDWAPRICE для расчета модифицированной дюрации.")
-    if effective_yield > 1.5:
-        effective_yield = effective_yield / 100.0
-    if effective_yield <= -1:
-        raise ValueError("Некорректное значение EFFECTIVEYIELDWAPRICE для расчета.")
 
     dmod = df_yield["DURATION"].iloc[-1] / (1 + effective_yield)
     price = df_yield["PRICE"].iloc[-1]
