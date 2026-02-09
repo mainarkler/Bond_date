@@ -4,3 +4,4 @@
  openpyxl
  httpx
  matplotlib
+ numpy
