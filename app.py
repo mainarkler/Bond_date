@@ -113,6 +113,9 @@ def request_get(url: str, timeout: int = 15, params=None):
 BASE_HISTORY_URL = (
     "https://iss.moex.com/iss/history/engines/stock/markets/shares/securities"
 )
+BASE_BOND_HISTORY_URL = (
+    "https://iss.moex.com/iss/history/engines/stock/markets/bonds/securities"
+)
 
 
 def isin_to_secid(isin: str) -> str:
@@ -135,6 +138,22 @@ def load_moex_history(secid: str) -> pd.DataFrame:
         js = response.json()
         rows = js["history"]["data"]
         cols = js["history"]["columns"]
+        if not rows:
+            break
+        all_rows.extend(rows)
+        start += len(rows)
+    return pd.DataFrame(all_rows, columns=cols)
+
+
+def load_bond_history(secid: str) -> pd.DataFrame:
+    start = 0
+    all_rows = []
+    while True:
+        url = f"{BASE_BOND_HISTORY_URL}/{secid}.json"
+        response = request_get(url, params={"start": start, "iss.meta": "off"}, timeout=20)
+        js = response.json()
+        rows = js.get("history", {}).get("data", [])
+        cols = js.get("history", {}).get("columns", [])
         if not rows:
             break
         all_rows.extend(rows)
@@ -206,6 +225,112 @@ def calculate_share_delta_p(
         "MDTV": float(mdtv),
     }
     return result, meta
+
+
+def load_bond_marketdata(secid: str) -> pd.DataFrame:
+    url = (
+        "https://iss.moex.com/iss/engines/stock/markets/bonds/securities/"
+        f"{secid}/marketdata.json"
+    )
+    response = request_get(url, params={"iss.only": "marketdata", "iss.meta": "off"}, timeout=20)
+    js = response.json()
+    if "marketdata" not in js:
+        raise ValueError(f"Нет ключа 'marketdata' для {secid}. Доступные ключи: {list(js.keys())}")
+    df = pd.DataFrame(js["marketdata"]["data"], columns=js["marketdata"]["columns"])
+    if "CLOSE" not in df.columns:
+        if "LAST" in df.columns:
+            df["CLOSE"] = df["LAST"]
+        elif "WAPRICE" in df.columns:
+            df["CLOSE"] = df["WAPRICE"]
+    for col in ["HIGH", "LOW", "CLOSE", "VALUE"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    required_cols = [col for col in ["HIGH", "LOW", "CLOSE", "VALUE"] if col in df.columns]
+    if required_cols:
+        df = df.dropna(subset=required_cols)
+    return df
+
+
+def load_bond_yielddata(secid: str) -> pd.DataFrame:
+    url = (
+        "https://iss.moex.com/iss/engines/stock/markets/bonds/securities/"
+        f"{secid}/marketdata_yields.json"
+    )
+    response = request_get(url, params={"iss.only": "marketdata_yields", "iss.meta": "off"}, timeout=20)
+    js = response.json()
+    if "marketdata_yields" not in js:
+        raise ValueError(
+            f"Нет ключа 'marketdata_yields' для {secid}. Доступные ключи: {list(js.keys())}"
+        )
+    df = pd.DataFrame(
+        js["marketdata_yields"]["data"], columns=js["marketdata_yields"]["columns"]
+    )
+    for col in ["DURATION", "PRICE", "EFFECTIVEYIELDWAPRICE"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    required_cols = [col for col in ["DURATION", "PRICE"] if col in df.columns]
+    if not required_cols:
+        raise ValueError("Нет DURATION/PRICE в данных marketdata_yields.")
+    df = df.dropna(subset=required_cols)
+    return df
+
+
+def calculate_bond_delta_p(isin: str, c_value: float, q_value: float) -> dict:
+    secid = isin_to_secid(isin)
+    df_hist = load_bond_history(secid)
+    df_md = load_bond_marketdata(secid)
+    df_yield = load_bond_yielddata(secid)
+
+    if df_md.empty or df_yield.empty:
+        raise ValueError("Нет рыночных данных для расчета.")
+
+    if df_hist.empty:
+        raise ValueError("Нет истории торгов для расчета σy.")
+
+    required_cols = ["TRADEDATE", "HIGH", "LOW", "CLOSE", "VALUE"]
+    missing_cols = [col for col in required_cols if col not in df_hist.columns]
+    if missing_cols:
+        raise ValueError(f"Не хватает колонок history: {', '.join(missing_cols)}")
+
+    df_hist = df_hist[required_cols].copy()
+    df_hist["TRADEDATE"] = pd.to_datetime(df_hist["TRADEDATE"])
+    num_cols = ["HIGH", "LOW", "CLOSE", "VALUE"]
+    df_hist[num_cols] = df_hist[num_cols].apply(pd.to_numeric, errors="coerce")
+    df_hist = df_hist.dropna(subset=num_cols)
+    t_len = len(df_hist)
+    if t_len == 0:
+        raise ValueError("Недостаточно данных для расчета σy.")
+
+    sigma_y = ((df_hist["HIGH"] - df_hist["LOW"]) / df_hist["CLOSE"]).sum() / t_len
+
+    mdtv = float(np.median(df_hist["VALUE"]))
+    if mdtv <= 0:
+        raise ValueError("Некорректное значение MDTV для расчета.")
+    delta_y = c_value * sigma_y * np.sqrt(q_value / mdtv)
+
+    effective_yield = df_yield["EFFECTIVEYIELDWAPRICE"].iloc[-1]
+    if pd.isna(effective_yield):
+        raise ValueError("Нет значения EFFECTIVEYIELDWAPRICE для расчета модифицированной дюрации.")
+    if effective_yield > 1.5:
+        effective_yield = effective_yield / 100.0
+    if effective_yield <= -1:
+        raise ValueError("Некорректное значение EFFECTIVEYIELDWAPRICE для расчета.")
+
+    dmod = df_yield["DURATION"].iloc[-1] / (1 + effective_yield)
+    price = df_yield["PRICE"].iloc[-1]
+    delta_p = -dmod * price * delta_y
+    delta_p_pct = (delta_p / price) * 100
+
+    return {
+        "SECID": secid,
+        "PRICE": float(price),
+        "DMOD": float(dmod),
+        "SIGMA_Y": float(sigma_y),
+        "MDTV": float(mdtv),
+        "DELTA_Y": float(delta_y),
+        "DELTA_P": float(delta_p),
+        "DELTA_P_PCT": float(delta_p_pct),
+    }
 
 
 def parse_number(value):
@@ -1285,7 +1410,111 @@ if st.session_state["active_view"] == "sell_stres":
 
     with bond_tab:
         st.markdown("### Bond")
-        st.info("Раздел Bond в разработке.")
+        use_q_from_list = st.checkbox(
+            "Вводить Q для каждого ISIN (формат: ISIN | Q)",
+            value=False,
+            key="bond_q_per_isin",
+        )
+        if use_q_from_list:
+            isin_q_input = st.text_area(
+                "Введите ISIN и Q (каждая строка: ISIN | Q)",
+                height=160,
+                placeholder="RU000A0JX0J2 | 25000000000\nRU000A0JX0J2 | 15000000000",
+                key="bond_isin_q_input",
+            )
+        else:
+            isin_input = st.text_area(
+                "Введите или вставьте ISIN (через Ctrl+V, пробел или запятую)",
+                height=160,
+                placeholder="RU000A0JX0J2\nRU000A0JX0J2",
+                key="bond_isin_input",
+            )
+
+        c_value = st.number_input(
+            "C (коэффициент, 0–1)",
+            min_value=0.0,
+            max_value=1.0,
+            value=1.0,
+            step=0.05,
+            format="%.2f",
+            key="bond_c_value",
+        )
+        q_value = st.number_input(
+            "Q",
+            min_value=1,
+            value=10_000_000,
+            step=100_000,
+            format="%d",
+            key="bond_q_value",
+            disabled=use_q_from_list,
+        )
+
+        if st.button("Рассчитать Sell_stres (Bond)", key="bond_calculate"):
+            entries = []
+            invalid_isins = []
+            if use_q_from_list:
+                raw_lines = [line.strip() for line in isin_q_input.splitlines() if line.strip()]
+                for line in raw_lines:
+                    parts = [p.strip() for p in re.split(r"[|;\t,]+", line) if p.strip()]
+                    if not parts:
+                        continue
+                    isin = parts[0].upper()
+                    q_val = parse_number(parts[1]) if len(parts) > 1 else None
+                    if not isin_format_valid(isin):
+                        invalid_isins.append(isin)
+                        continue
+                    if q_val is None or q_val <= 0:
+                        st.warning(f"Некорректный Q для {isin}: {parts[1] if len(parts) > 1 else ''}")
+                        continue
+                    entries.append({"ISIN": isin, "Q_VALUE": float(q_val)})
+            else:
+                raw_text = isin_input.strip()
+                if raw_text:
+                    isins = re.split(r"[\s,;]+", raw_text)
+                    isins = [i.strip().upper() for i in isins if i.strip()]
+                    for isin in isins:
+                        if not isin_format_valid(isin):
+                            invalid_isins.append(isin)
+                            continue
+                        entries.append({"ISIN": isin, "Q_VALUE": float(q_value)})
+
+            if invalid_isins:
+                st.warning(
+                    "Некорректные по формату ISIN пропущены: "
+                    f"{', '.join(invalid_isins[:10])}{'...' if len(invalid_isins) > 10 else ''}"
+                )
+            if not entries:
+                st.error("Нет валидных ISIN для обработки.")
+            else:
+                results = []
+                progress_bar = st.progress(0.0)
+                with st.spinner("Рассчитываем Sell_stres (Bond)..."):
+                    for idx, entry in enumerate(entries, start=1):
+                        isin = entry["ISIN"]
+                        try:
+                            result = calculate_bond_delta_p(
+                                isin=isin,
+                                c_value=float(c_value),
+                                q_value=float(entry["Q_VALUE"]),
+                            )
+                            result["ISIN"] = isin
+                            result["Q"] = float(entry["Q_VALUE"])
+                            results.append(result)
+                        except Exception as exc:
+                            st.error(f"{isin}: {exc}")
+                        progress_bar.progress(idx / len(entries))
+
+                if results:
+                    results_df = pd.DataFrame(results)
+                    st.markdown("#### Результаты ΔP (Bond)")
+                    st.dataframe(results_df, use_container_width=True)
+                    csv_bytes = results_df.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        label="💾 Скачать ΔP CSV (Bond)",
+                        data=csv_bytes,
+                        file_name="bond_deltaP.csv",
+                        mime="text/csv",
+                    )
 
     st.stop()
 
