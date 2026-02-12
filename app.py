@@ -477,7 +477,7 @@ def fetch_vm_data(trade_name: str, forts_rows=None):
         "iss.only": "securities",
         "securities.columns": "PREVSETTLEPRICE,MINSTEP,STEPPRICE,LASTSETTLEPRICE",
     }
-    spec = request_get(spec_url, timeout=20, params=spec_params).json()
+    spec = request_get(spec_url, timeout=200, params=spec_params).json()
     prev_settle_raw, minstep_raw, stepprice_raw, last_settle_raw = spec["securities"]["data"][0]
     prev_settle = to_decimal(prev_settle_raw)
     minstep = to_decimal(minstep_raw)
@@ -492,7 +492,7 @@ def fetch_vm_data(trade_name: str, forts_rows=None):
         "sort_order": "desc",
         "limit": 1,
     }
-    history = request_get(hist_url, timeout=20, params=hist_params).json()
+    history = request_get(hist_url, timeout=200, params=hist_params).json()
     rows = history.get("history", {}).get("data", [])
     if not rows or rows[0][1] is None:
         raise RuntimeError("Дневной клиринг ещё не опубликован")
