@@ -115,7 +115,7 @@ BASE_HISTORY_URL = (
 
 def isin_to_secid(isin: str) -> str:
     params = {"q": isin, "iss.meta": "off"}
-    response = request_get("https://iss.moex.com/iss/securities.json", params=params, timeout=200)
+    response = request_get("https://iss.moex.com/iss/securities.json", params=params, timeout=20)
     js = response.json()
     df = pd.DataFrame(js["securities"]["data"], columns=js["securities"]["columns"])
     df = df[df["isin"] == isin]
@@ -129,7 +129,7 @@ def load_moex_history(secid: str) -> pd.DataFrame:
     all_rows = []
     while True:
         url = f"{BASE_HISTORY_URL}/{secid}.json"
-        response = request_get(url, params={"start": start}, timeout=200)
+        response = request_get(url, params={"start": start}, timeout=20)
         js = response.json()
         rows = js["history"]["data"]
         cols = js["history"]["columns"]
@@ -226,7 +226,7 @@ def load_bond_history(secid: str) -> pd.DataFrame:
             "https://iss.moex.com/iss/history/engines/stock/markets/bonds/securities/"
             f"{secid}.json"
         )
-        response = request_get(url, params={"start": start, "iss.meta": "off"}, timeout=200)
+        response = request_get(url, params={"start": start, "iss.meta": "off"}, timeout=20)
         js = response.json()
         rows = js.get("history", {}).get("data", [])
         cols = js.get("history", {}).get("columns", [])
@@ -242,7 +242,7 @@ def load_bond_yield_data(secid: str) -> pd.DataFrame:
         "https://iss.moex.com/iss/engines/stock/markets/bonds/"
         f"securities/{secid}/marketdata_yields.json"
     )
-    response = request_get(url, params={"iss.meta": "off"}, timeout=200)
+    response = request_get(url, params={"iss.meta": "off"}, timeout=20)
     js = response.json()
     if "marketdata_yields" not in js:
         raise ValueError("Нет блока marketdata_yields")
@@ -357,7 +357,7 @@ def fetch_forts_securities():
         "iss.only": "securities",
         "securities.columns": "SECID,SHORTNAME",
     }
-    r = request_get(url, timeout=200, params=params)
+    r = request_get(url, timeout=20, params=params)
     xml_content = r.content.decode("utf-8", errors="ignore")
     xml_content = re.sub(r'\sxmlns="[^"]+"', "", xml_content, count=1)
     root = ET.fromstring(xml_content)
@@ -477,7 +477,7 @@ def fetch_vm_data(trade_name: str, forts_rows=None):
         "iss.only": "securities",
         "securities.columns": "PREVSETTLEPRICE,MINSTEP,STEPPRICE,LASTSETTLEPRICE",
     }
-    spec = request_get(spec_url, timeout=2000, params=spec_params).json()
+    spec = request_get(spec_url, timeout=200, params=spec_params).json()
     prev_settle_raw, minstep_raw, stepprice_raw, last_settle_raw = spec["securities"]["data"][0]
     prev_settle = to_decimal(prev_settle_raw)
     minstep = to_decimal(minstep_raw)
@@ -492,7 +492,7 @@ def fetch_vm_data(trade_name: str, forts_rows=None):
         "sort_order": "desc",
         "limit": 1,
     }
-    history = request_get(hist_url, timeout=2000, params=hist_params).json()
+    history = request_get(hist_url, timeout=200, params=hist_params).json()
     rows = history.get("history", {}).get("data", [])
     if not rows or rows[0][1] is None:
         raise RuntimeError("Дневной клиринг ещё не опубликован")
@@ -588,7 +588,7 @@ def fetch_board_xml(board: str):
         f"{board.lower()}/securities.xml?marketprice_board=3&iss.meta=off"
     )
     try:
-        r = request_get(url, timeout=200)
+        r = request_get(url, timeout=20)
         xml_content = r.content.decode("utf-8", errors="ignore")
         xml_content = re.sub(r'\sxmlns="[^"]+"', "", xml_content, count=1)
         root = ET.fromstring(xml_content)
