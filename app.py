@@ -123,17 +123,25 @@ def moex_request(url: str, params=None, timeout=(5, 20)):
         elapsed = now - st.session_state.get("global_http_gate", 0.0)
         if elapsed < 1.0:
             time.sleep(1.0 - elapsed)
-        st.session_state["global_http_gate"] = now
+        st.session_state["global_http_gate"] = time.time()
         response = get_session().get(url, params=params, timeout=timeout)
         response.raise_for_status()
         st.session_state["last_http_error"] = ""
         return response
     except ConnectTimeout:
-        msg = "Превышено время установки соединения с MOEX (ConnectTimeout)."
-        if st.session_state.get("last_http_error") != msg:
-            st.error(msg)
-            st.session_state["last_http_error"] = msg
-        return None
+        # Один мягкий повтор с более длинным connect timeout для плавающих сетевых лагов.
+        retry_timeout = (10, timeout[1] if isinstance(timeout, tuple) and len(timeout) > 1 else 20)
+        try:
+            response = get_session().get(url, params=params, timeout=retry_timeout)
+            response.raise_for_status()
+            st.session_state["last_http_error"] = ""
+            return response
+        except ConnectTimeout:
+            msg = "Превышено время установки соединения с MOEX (ConnectTimeout)."
+            if st.session_state.get("last_http_error") != msg:
+                st.warning(msg)
+                st.session_state["last_http_error"] = msg
+            return None
     except ReadTimeout:
         msg = "MOEX слишком долго отвечает (ReadTimeout)."
         if st.session_state.get("last_http_error") != msg:
