@@ -1,7 +1,7 @@
- streamlit 
- pandas 
- requests
- openpyxl
- httpx
- matplotlib
- numpy
+flask
+pandas
+requests
+openpyxl
+httpx
+matplotlib
+numpy
