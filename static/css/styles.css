@@ -1,0 +1,17 @@
+:root {
+  color-scheme: dark;
+}
+
+.glow-card {
+  transition: transform 0.25s ease, box-shadow 0.25s ease, border-color 0.25s ease;
+}
+
+.glow-card:hover {
+  transform: translateY(-4px) scale(1.01);
+  box-shadow: 0 16px 45px rgba(30, 64, 175, 0.22);
+  border-color: rgba(59, 130, 246, 0.5);
+}
+
+.mobile-drawer {
+  backdrop-filter: blur(8px);
+}
