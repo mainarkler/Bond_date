@@ -13,6 +13,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from requests.adapters import HTTPAdapter
+from requests.exceptions import ConnectTimeout, ReadTimeout, RequestException
 from urllib3.util.retry import Retry
 
 # ---------------------------
@@ -32,6 +33,20 @@ if "last_file_name" not in st.session_state:
     st.session_state["last_file_name"] = None
 if "active_view" not in st.session_state:
     st.session_state["active_view"] = "home"
+if "market_store" not in st.session_state:
+    st.session_state["market_store"] = {"fast": {}, "slow": {}, "meta": {}}
+if "last_fast_refresh" not in st.session_state:
+    st.session_state["last_fast_refresh"] = 0.0
+if "last_slow_refresh" not in st.session_state:
+    st.session_state["last_slow_refresh"] = 0.0
+if "refresh_in_progress" not in st.session_state:
+    st.session_state["refresh_in_progress"] = False
+if "global_http_gate" not in st.session_state:
+    st.session_state["global_http_gate"] = 0.0
+st.session_state["_rerun_id"] = st.session_state.get("_rerun_id", 0) + 1
+
+if hasattr(st, "autorefresh") and st.session_state["active_view"] != "home":
+    st.autorefresh(interval=5000, key="market_refresh")
 
 # ---------------------------
 # Main navigation
@@ -79,30 +94,240 @@ if st.session_state["active_view"] == "home":
     st.stop()
 
 # ---------------------------
-# HTTP session with retries
+# HTTP helpers for Streamlit reruns
 # ---------------------------
-def build_http_session():
+@st.cache_resource
+def get_session() -> requests.Session:
+    """Один Session на процесс Streamlit: переиспользует TCP соединения."""
     session = requests.Session()
     retry_strategy = Retry(
-        total=5,
-        backoff_factor=0.8,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"],
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET"],
     )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=50, pool_maxsize=50)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-    session.headers.update({"User-Agent": "python-requests/iss-moex-script"})
+    session.headers.update({"User-Agent": "Mozilla/5.0 Streamlit MOEX Client"})
     return session
 
 
-HTTP_SESSION = build_http_session()
+def moex_request(url: str, params=None, timeout=(5, 20)):
+    """Единая точка HTTP-запросов с таймаутами и обработкой ошибок."""
+    try:
+        # Global throttle: не более 1 нового HTTP-запроса в секунду.
+        now = time.time()
+        if now - st.session_state.get("global_http_gate", 0.0) < 1.0:
+            return None
+        st.session_state["global_http_gate"] = now
+        response = get_session().get(url, params=params, timeout=timeout)
+        response.raise_for_status()
+        return response
+    except ConnectTimeout:
+        st.error("Превышено время установки соединения с MOEX (ConnectTimeout).")
+        return None
+    except ReadTimeout:
+        st.error("MOEX слишком долго отвечает (ReadTimeout).")
+        return None
+    except RequestException as exc:
+        st.error(f"Ошибка запроса к MOEX: {exc}")
+        return None
 
 
-def request_get(url: str, timeout: int = 15, params=None):
-    response = HTTP_SESSION.get(url, timeout=timeout, params=params)
-    response.raise_for_status()
-    return response
+def _guarded_cache_get(cache_bucket: str, key: str, ttl: int):
+    now = time.time()
+    ts_key = f"last_{cache_bucket}_update"
+    data_key = f"{cache_bucket}_cache"
+    if ts_key not in st.session_state:
+        st.session_state[ts_key] = 0.0
+    if data_key not in st.session_state:
+        st.session_state[data_key] = {}
+    cache = st.session_state[data_key]
+    last_update = st.session_state[ts_key]
+    if key in cache and (now - last_update) < ttl:
+        return cache[key], True
+    return None, False
+
+
+def _guarded_cache_set(cache_bucket: str, key: str, value):
+    ts_key = f"last_{cache_bucket}_update"
+    data_key = f"{cache_bucket}_cache"
+    if data_key not in st.session_state:
+        st.session_state[data_key] = {}
+    st.session_state[data_key][key] = value
+    st.session_state[ts_key] = time.time()
+
+
+def should_refresh(layer_name: str, ttl: int) -> bool:
+    """Gate refresh: TTL + защита от двойного запуска в одном rerun."""
+    now = time.time()
+    last_key = f"last_{layer_name}_refresh"
+    rerun_key = f"{layer_name}_refresh_rerun"
+    last_refresh = st.session_state.get(last_key, 0.0)
+    current_rerun = st.session_state.get("_rerun_id", 0)
+    if st.session_state.get(rerun_key) == current_rerun:
+        return False
+    if (now - last_refresh) < ttl:
+        return False
+    st.session_state[rerun_key] = current_rerun
+    return True
+
+
+def _warn_once(key: str, message: str):
+    warn_key = f"warned_{key}"
+    if not st.session_state.get(warn_key, False):
+        st.warning(message)
+        st.session_state[warn_key] = True
+
+
+def refresh_data_if_needed():
+    """Pseudo-async controller: обновляет store по TTL, иначе только читает кэш."""
+    if st.session_state.get("refresh_in_progress", False):
+        return st.session_state["market_store"]
+
+    st.session_state["refresh_in_progress"] = True
+    try:
+        current_store = st.session_state.get("market_store", {"fast": {}, "slow": {}, "meta": {}})
+        new_store = {
+            "fast": dict(current_store.get("fast", {})),
+            "slow": dict(current_store.get("slow", {})),
+            "meta": dict(current_store.get("meta", {})),
+        }
+        now = time.time()
+        current_rerun = st.session_state.get("_rerun_id", 0)
+        decided_rerun = st.session_state.get("refresh_decided_rerun")
+
+        # Решение refresh принимается один раз за rerun.
+        if decided_rerun != current_rerun:
+            st.session_state["fast_should_refresh"] = should_refresh("fast", ttl=5)
+            st.session_state["slow_should_refresh"] = should_refresh("slow", ttl=180)
+            st.session_state["refresh_decided_rerun"] = current_rerun
+
+        fast_should_refresh = st.session_state.get("fast_should_refresh", False)
+        slow_should_refresh = st.session_state.get("slow_should_refresh", False)
+
+        if fast_should_refresh:
+            st.session_state["last_fast_refresh"] = now
+            for key in list(new_store["fast"].keys()):
+                if "?" in key:
+                    endpoint, query = key.split("?", 1)
+                    params = dict(item.split("=", 1) for item in query.split("&") if "=" in item)
+                else:
+                    endpoint, params = key, None
+                payload = load_moex_data(endpoint, params=params)
+                if payload is not None:
+                    new_store["fast"][key] = payload
+
+        if slow_should_refresh:
+            st.session_state["last_slow_refresh"] = now
+            for key in list(new_store["slow"].keys()):
+                if "?" in key:
+                    endpoint, query = key.split("?", 1)
+                    params = dict(item.split("=", 1) for item in query.split("&") if "=" in item)
+                else:
+                    endpoint, params = key, None
+                payload = load_moex_data(endpoint, params=params)
+                if payload is not None:
+                    new_store["slow"][key] = payload
+
+        # Atomic update store.
+        st.session_state["market_store"] = new_store
+        return new_store
+    except Exception:
+        _warn_once("refresh_controller", "Не удалось обновить контроллер данных, показаны последние кэш-данные.")
+        return st.session_state.get("market_store", {"fast": {}, "slow": {}, "meta": {}})
+    finally:
+        st.session_state["refresh_in_progress"] = False
+
+
+@st.cache_data(ttl=30)
+def load_moex_data(endpoint: str, params=None):
+    """Кэш JSON-ответов, чтобы не дёргать API на каждом rerun."""
+    url = f"https://iss.moex.com/iss/{endpoint.lstrip('/')}"
+    response = moex_request(url, params=params, timeout=(5, 20))
+    return response.json() if response is not None else None
+
+
+def _make_cache_key(endpoint: str, params=None) -> str:
+    if not params:
+        return endpoint
+    items = sorted((str(k), str(v)) for k, v in params.items())
+    return f"{endpoint}?{'&'.join([f'{k}={v}' for k, v in items])}"
+
+
+def load_fast_data(endpoint: str, params=None):
+    """FAST cache слой (5 сек): цены/market/history."""
+    refresh_data_if_needed()
+    key = _make_cache_key(endpoint, params)
+    store_fast = st.session_state["market_store"].setdefault("fast", {})
+    if key in store_fast and not st.session_state.get("fast_should_refresh", False):
+        return store_fast[key]
+    cached, hit = _guarded_cache_get("fast", key, ttl=5)
+    if hit:
+        store_fast[key] = cached
+        return cached
+    data = load_moex_data(endpoint, params=params)
+    if data is not None:
+        _guarded_cache_set("fast", key, data)
+        store_fast[key] = data
+    else:
+        _warn_once("fast_refresh", "Fast-обновление временно недоступно, используются предыдущие данные.")
+        return store_fast.get(key)
+    return data
+
+
+def load_slow_data(endpoint: str, params=None):
+    """SLOW cache слой (120 сек): lookup/meta/mapping."""
+    refresh_data_if_needed()
+    key = _make_cache_key(endpoint, params)
+    store_slow = st.session_state["market_store"].setdefault("slow", {})
+    if key in store_slow and not st.session_state.get("slow_should_refresh", False):
+        return store_slow[key]
+    cached, hit = _guarded_cache_get("slow", key, ttl=120)
+    if hit:
+        store_slow[key] = cached
+        return cached
+    data = load_moex_data(endpoint, params=params)
+    if data is not None:
+        _guarded_cache_set("slow", key, data)
+        store_slow[key] = data
+    else:
+        _warn_once("slow_refresh", "Slow-обновление временно недоступно, используются предыдущие данные.")
+        return store_slow.get(key)
+    return data
+
+
+def request_get(url: str, timeout=(5, 20), params=None):
+    """Совместимость со старым кодом: все GET идут через единый HTTP слой."""
+    if isinstance(timeout, (int, float)):
+        timeout = (5, int(timeout))
+    return moex_request(url, params=params, timeout=timeout)
+
+
+@st.cache_data(ttl=120)
+def batch_fetch_securities(secids: list[str]):
+    """Batch lookup в один ISS-запрос через q=..."""
+    terms = [str(x).strip().upper() for x in secids if str(x).strip()]
+    if not terms:
+        return {}
+    params = {"q": ",".join(sorted(set(terms))), "iss.meta": "off"}
+    js = load_slow_data("securities.json", params=params)
+    if not js:
+        return {}
+    rows = js.get("securities", {}).get("data", [])
+    cols = [c.lower() for c in js.get("securities", {}).get("columns", [])]
+    if not rows or not cols:
+        return {}
+    df = pd.DataFrame(rows, columns=cols)
+    result = {}
+    for _, row in df.iterrows():
+        isin_val = str(row.get("isin") or "").upper()
+        secid_val = str(row.get("secid") or "")
+        emitter_val = row.get("emitter_id") if "emitter_id" in df.columns else row.get("emitterid")
+        if isin_val:
+            result[isin_val] = {"SECID": secid_val or None, "EMITTER_ID": emitter_val}
+    return result
 
 
 # ---------------------------
@@ -114,9 +339,15 @@ BASE_HISTORY_URL = (
 
 
 def isin_to_secid(isin: str) -> str:
+    isin = str(isin).strip().upper()
+    batched = batch_fetch_securities([isin])
+    if isin in batched and batched[isin].get("SECID"):
+        return batched[isin]["SECID"]
+
     params = {"q": isin, "iss.meta": "off"}
-    response = request_get("https://iss.moex.com/iss/securities.json", params=params, timeout=20)
-    js = response.json()
+    js = load_slow_data("securities.json", params=params)
+    if not js:
+        raise ValueError("MOEX временно недоступен")
     df = pd.DataFrame(js["securities"]["data"], columns=js["securities"]["columns"])
     df = df[df["isin"] == isin]
     if df.empty:
@@ -124,15 +355,18 @@ def isin_to_secid(isin: str) -> str:
     return df["secid"].iloc[0]
 
 
+@st.cache_data(ttl=5)
 def load_moex_history(secid: str) -> pd.DataFrame:
     start = 0
     all_rows = []
+    cols = []
     while True:
-        url = f"{BASE_HISTORY_URL}/{secid}.json"
-        response = request_get(url, params={"start": start}, timeout=20)
-        js = response.json()
-        rows = js["history"]["data"]
-        cols = js["history"]["columns"]
+        endpoint = f"history/engines/stock/markets/shares/securities/{secid}.json"
+        js = load_fast_data(endpoint, params={"start": start})
+        if not js:
+            return pd.DataFrame(columns=cols)
+        rows = js.get("history", {}).get("data", [])
+        cols = js.get("history", {}).get("columns", cols)
         if not rows:
             break
         all_rows.extend(rows)
@@ -218,18 +452,18 @@ def generate_q(mode: str, q_max: int, points: int) -> np.ndarray:
     raise ValueError("Q_MODE должен быть 'linear' или 'log'")
 
 
+@st.cache_data(ttl=5)
 def load_bond_history(secid: str) -> pd.DataFrame:
     start = 0
     rows_all = []
+    cols = []
     while True:
-        url = (
-            "https://iss.moex.com/iss/history/engines/stock/markets/bonds/securities/"
-            f"{secid}.json"
-        )
-        response = request_get(url, params={"start": start, "iss.meta": "off"}, timeout=20)
-        js = response.json()
+        endpoint = f"history/engines/stock/markets/bonds/securities/{secid}.json"
+        js = load_fast_data(endpoint, params={"start": start, "iss.meta": "off"})
+        if not js:
+            return pd.DataFrame(columns=cols)
         rows = js.get("history", {}).get("data", [])
-        cols = js.get("history", {}).get("columns", [])
+        cols = js.get("history", {}).get("columns", cols)
         if not rows:
             break
         rows_all.extend(rows)
@@ -238,14 +472,10 @@ def load_bond_history(secid: str) -> pd.DataFrame:
 
 
 def load_bond_yield_data(secid: str) -> pd.DataFrame:
-    url = (
-        "https://iss.moex.com/iss/engines/stock/markets/bonds/"
-        f"securities/{secid}/marketdata_yields.json"
-    )
-    response = request_get(url, params={"iss.meta": "off"}, timeout=20)
-    js = response.json()
-    if "marketdata_yields" not in js:
-        raise ValueError("Нет блока marketdata_yields")
+    endpoint = f"engines/stock/markets/bonds/securities/{secid}/marketdata_yields.json"
+    js = load_fast_data(endpoint, params={"iss.meta": "off"})
+    if not js or "marketdata_yields" not in js:
+        return pd.DataFrame()
     df = pd.DataFrame(
         js["marketdata_yields"]["data"],
         columns=js["marketdata_yields"]["columns"],
@@ -357,7 +587,9 @@ def fetch_forts_securities():
         "iss.only": "securities",
         "securities.columns": "SECID,SHORTNAME",
     }
-    r = request_get(url, timeout=20, params=params)
+    r = request_get(url, timeout=(5, 20), params=params)
+    if r is None:
+        return []
     xml_content = r.content.decode("utf-8", errors="ignore")
     xml_content = re.sub(r'\sxmlns="[^"]+"', "", xml_content, count=1)
     root = ET.fromstring(xml_content)
@@ -400,8 +632,9 @@ def money_decimal(value: Decimal) -> Decimal:
 @st.cache_data(ttl=3600)
 def get_usd_rub_cb_today():
     url = "https://www.cbr.ru/scripts/XML_daily.asp"
-    r = requests.get(url, timeout=10)
-    r.raise_for_status()
+    r = request_get(url, timeout=(5, 20))
+    if r is None:
+        raise RuntimeError("Сервис ЦБ временно недоступен")
 
     root = ET.fromstring(r.content)
     for valute in root.findall("Valute"):
@@ -477,8 +710,12 @@ def fetch_vm_data(trade_name: str, forts_rows=None):
         "iss.only": "securities",
         "securities.columns": "PREVSETTLEPRICE,MINSTEP,STEPPRICE,LASTSETTLEPRICE",
     }
-    spec = request_get(spec_url, timeout=200, params=spec_params).json()
-    prev_settle_raw, minstep_raw, stepprice_raw, last_settle_raw = spec["securities"]["data"][0]
+    _spec_resp = request_get(spec_url, timeout=200, params=spec_params)
+    spec = _spec_resp.json() if _spec_resp is not None else {"securities": {"data": []}}
+    sec_rows = spec.get("securities", {}).get("data", [])
+    if not sec_rows:
+        raise RuntimeError("Не удалось получить спецификацию контракта")
+    prev_settle_raw, minstep_raw, stepprice_raw, last_settle_raw = sec_rows[0]
     prev_settle = to_decimal(prev_settle_raw)
     minstep = to_decimal(minstep_raw)
     stepprice = to_decimal(stepprice_raw)
@@ -492,7 +729,8 @@ def fetch_vm_data(trade_name: str, forts_rows=None):
         "sort_order": "desc",
         "limit": 1,
     }
-    history = request_get(hist_url, timeout=200, params=hist_params).json()
+    _hist_resp = request_get(hist_url, timeout=200, params=hist_params)
+    history = _hist_resp.json() if _hist_resp is not None else {"history": {"data": []}}
     rows = history.get("history", {}).get("data", [])
     if not rows or rows[0][1] is None:
         raise RuntimeError("Дневной клиринг ещё не опубликован")
@@ -588,7 +826,9 @@ def fetch_board_xml(board: str):
         f"{board.lower()}/securities.xml?marketprice_board=3&iss.meta=off"
     )
     try:
-        r = request_get(url, timeout=20)
+        r = request_get(url, timeout=(5, 20))
+        if r is None:
+            return {}
         xml_content = r.content.decode("utf-8", errors="ignore")
         xml_content = re.sub(r'\sxmlns="[^"]+"', "", xml_content, count=1)
         root = ET.fromstring(xml_content)
@@ -606,8 +846,9 @@ def fetch_board_xml(board: str):
         return {}
 
 
-TQOB_MAP = fetch_board_xml("tqob")
-TQCB_MAP = fetch_board_xml("tqcb")
+def get_board_maps():
+    """Ленивая загрузка board fallback без top-level HTTP."""
+    return fetch_board_xml("tqob"), fetch_board_xml("tqcb")
 
 # ---------------------------
 # Fetch emitter & secid (with caching)
@@ -620,10 +861,15 @@ def fetch_emitter_and_secid(isin: str):
     emitter_id = None
     secid = None
 
+    prefetched = st.session_state.get("batch_isin_map", {}).get(isin, {})
+    if prefetched.get("SECID"):
+        secid = prefetched.get("SECID")
+        emitter_id = prefetched.get("EMITTER_ID")
+
     try:
-        url = f"https://iss.moex.com/iss/securities/{isin}.json"
-        r = request_get(url, timeout=10)
-        data = r.json()
+        data = load_slow_data(f"securities/{isin}.json")
+        if not data:
+            data = {}
         securities = data.get("securities", {})
         cols = securities.get("columns", [])
         rows = securities.get("data", [])
@@ -643,6 +889,8 @@ def fetch_emitter_and_secid(isin: str):
         try:
             url = f"https://iss.moex.com/iss/securities/{isin}.xml?iss.meta=off"
             r = request_get(url, timeout=10)
+            if r is None:
+                raise ValueError("empty response")
             xml_content = r.content.decode("utf-8", errors="ignore")
             xml_content = re.sub(r'\sxmlns="[^"]+"', "", xml_content, count=1)
             root = ET.fromstring(xml_content)
@@ -657,7 +905,8 @@ def fetch_emitter_and_secid(isin: str):
             pass
 
     if not secid:
-        mapping = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
+        tqob_map, tqcb_map = get_board_maps()
+        mapping = tqob_map.get(isin) or tqcb_map.get(isin)
         if mapping:
             secid = mapping.get("SECID")
             if not emitter_id:
@@ -685,7 +934,7 @@ def get_bond_data(isin: str):
             try:
                 url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
                 r = request_get(url_info, timeout=10)
-                data_info = r.json()
+                data_info = r.json() if r is not None else {}
                 rows_info = data_info.get("securities", {}).get("data", [])
                 cols_info = data_info.get("securities", {}).get("columns", [])
                 if rows_info and cols_info:
@@ -701,7 +950,7 @@ def get_bond_data(isin: str):
             try:
                 url_info_isin = f"https://iss.moex.com/iss/securities/{isin}.json"
                 r = request_get(url_info_isin, timeout=10)
-                data_info_isin = r.json()
+                data_info_isin = r.json() if r is not None else {}
                 rows = data_info_isin.get("securities", {}).get("data", [])
                 cols = data_info_isin.get("securities", {}).get("columns", [])
                 if rows and cols:
@@ -724,7 +973,7 @@ def get_bond_data(isin: str):
                     f"bondization/{identifier}.json?iss.only=coupons,bondization&iss.meta=off"
                 )
                 r = request_get(url_coupons, timeout=10)
-                data = r.json()
+                data = r.json() if r is not None else {}
                 coupons = data.get("coupons", {}).get("data", [])
                 cols = data.get("coupons", {}).get("columns", [])
                 bond_rows = data.get("bondization", {}).get("data", [])
@@ -872,8 +1121,9 @@ def get_bond_data(isin: str):
                 coupon_value_rub = norm_str(chosen_row.get(val_rub_col)) if val_rub_col else None
                 coupon_value_prc = norm_str(chosen_row.get(val_prc_col)) if val_prc_col else None
 
-        if (not record_date or not coupon_date or not coupon_currency) and (TQOB_MAP or TQCB_MAP):
-            mapping = TQOB_MAP.get(isin) or TQCB_MAP.get(isin)
+        if not record_date or not coupon_date or not coupon_currency:
+            tqob_map, tqcb_map = get_board_maps()
+            mapping = tqob_map.get(isin) or tqcb_map.get(isin)
             if mapping:
                 if not record_date:
                     record_date = mapping.get("RECORDDATE") or mapping.get("RECORD_DATE") or mapping.get("RECORD")
@@ -936,7 +1186,7 @@ def get_bond_schedule(isin: str):
         try:
             url_info = f"https://iss.moex.com/iss/engines/stock/markets/bonds/securities/{secid}.json"
             r = request_get(url_info, timeout=10)
-            data_info = r.json()
+            data_info = r.json() if r is not None else {}
             rows_info = data_info.get("securities", {}).get("data", [])
             cols_info = data_info.get("securities", {}).get("columns", [])
             if rows_info and cols_info:
@@ -953,7 +1203,7 @@ def get_bond_schedule(isin: str):
         try:
             url_info_isin = f"https://iss.moex.com/iss/securities/{isin}.json"
             r = request_get(url_info_isin, timeout=10)
-            data_info_isin = r.json()
+            data_info_isin = r.json() if r is not None else {}
             rows = data_info_isin.get("securities", {}).get("data", [])
             cols = data_info_isin.get("securities", {}).get("columns", [])
             if rows and cols:
@@ -973,7 +1223,7 @@ def get_bond_schedule(isin: str):
                 f"bondization/{identifier}.json?iss.only=coupons,bondization&iss.meta=off"
             )
             r = request_get(url_coupons, timeout=10)
-            data = r.json()
+            data = r.json() if r is not None else {}
             coupons = data.get("coupons", {}).get("data", [])
             cols = data.get("coupons", {}).get("columns", [])
             bond_rows = data.get("bondization", {}).get("data", [])
@@ -1603,6 +1853,8 @@ with tab2:
             if not isins:
                 st.error("Нет валидных ISIN для обработки.")
             else:
+                # Batch lookup заранее, чтобы снизить N+1 запросы при массовой обработке.
+                st.session_state["batch_isin_map"] = batch_fetch_securities(isins)
                 max_workers = st.sidebar.slider("Параллельных потоков (workers)", 2, 40, 10)
                 with st.spinner("Запрос данных..."):
                     results = fetch_isins_parallel(isins, max_workers=max_workers, show_progress=True)
@@ -1656,6 +1908,8 @@ if uploaded_file:
 
         st.write(f"Найдено {len(isins)} валидных уникальных ISIN для обработки.")
         if isins:
+            # Batch lookup заранее, чтобы снизить N+1 запросы при массовой обработке.
+            st.session_state["batch_isin_map"] = batch_fetch_securities(isins)
             max_workers = st.sidebar.slider("Параллельных потоков (workers)", 2, 40, 10)
             with st.spinner("Запрос данных по файлу..."):
                 results = fetch_isins_parallel(isins, max_workers=max_workers, show_progress=True)
@@ -1669,7 +1923,10 @@ if uploaded_file:
 def fetch_emitter_names():
     url = "https://raw.githubusercontent.com/mainarkler/Bond_date/refs/heads/main/Pifagr_name_with_emitter.csv"
     try:
-        df_emitters = pd.read_csv(url, dtype=str)
+        response = request_get(url, timeout=(5, 20))
+        if response is None:
+            return pd.DataFrame(columns=["Issuer", "EMITTER_ID"])
+        df_emitters = pd.read_csv(StringIO(response.text), dtype=str)
         df_emitters.columns = [c.strip() for c in df_emitters.columns]
         return df_emitters
     except Exception:
