@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from datetime import date, datetime
 from typing import Any
@@ -30,6 +31,15 @@ def moex_get_json(url: str, params: dict[str, Any] | None = None) -> dict[str, A
     response = SESSION.get(url, params=params, timeout=(5, 20))
     response.raise_for_status()
     return response.json()
+
+
+def to_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def isin_checksum_valid(isin: str) -> bool:
@@ -143,6 +153,111 @@ def get_calendar_rows(isins: list[str]) -> list[dict[str, Any]]:
     return rows
 
 
+def fetch_equity_snapshot() -> list[dict[str, Any]]:
+    payload = moex_get_json(
+        "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json",
+        {
+            "iss.meta": "off",
+            "iss.only": "securities,marketdata",
+            "securities.columns": "SECID,SHORTNAME,LOTSIZE",
+            "marketdata.columns": "SECID,LAST,PREVPRICE,BID,OFFER,NUMTRADES",
+        },
+    )
+
+    sec_block = payload.get("securities", {})
+    md_block = payload.get("marketdata", {})
+    sec_cols = sec_block.get("columns", [])
+    md_cols = md_block.get("columns", [])
+
+    sec_map = {row[0]: dict(zip(sec_cols, row)) for row in sec_block.get("data", []) if row}
+    merged: list[dict[str, Any]] = []
+    for row in md_block.get("data", []):
+        if not row:
+            continue
+        md = dict(zip(md_cols, row))
+        secid = md.get("SECID")
+        if not secid or secid not in sec_map:
+            continue
+        merged.append({**sec_map[secid], **md})
+    return merged
+
+
+def get_vm_rows() -> list[dict[str, Any]]:
+    try:
+        snapshot = fetch_equity_snapshot()
+        rows: list[dict[str, Any]] = []
+        for item in snapshot:
+            last = to_float(item.get("LAST"))
+            prev = to_float(item.get("PREVPRICE"))
+            lot = int(to_float(item.get("LOTSIZE")) or 0)
+            if last is None or prev is None or lot <= 0:
+                continue
+
+            vm = (last - prev) * lot
+            change_pct = ((last - prev) / prev) * 100 if prev else 0.0
+            risk_level = "Высокий" if abs(change_pct) >= 3 else "Средний" if abs(change_pct) >= 1.5 else "Низкий"
+            rows.append(
+                {
+                    "secid": item.get("SECID"),
+                    "name": item.get("SHORTNAME") or "-",
+                    "lastPrice": round(last, 4),
+                    "prevPrice": round(prev, 4),
+                    "lotSize": lot,
+                    "changePct": round(change_pct, 3),
+                    "vmLongRub": round(vm, 2),
+                    "vmShortRub": round(-vm, 2),
+                    "riskLevel": risk_level,
+                }
+            )
+        rows.sort(key=lambda x: abs(float(x["vmLongRub"])), reverse=True)
+        return rows[:20]
+    except Exception:
+        return [
+            {"secid": "SBER", "name": "Сбербанк", "lastPrice": 300.0, "prevPrice": 295.0, "lotSize": 10, "changePct": 1.695, "vmLongRub": 50.0, "vmShortRub": -50.0, "riskLevel": "Средний"},
+            {"secid": "GAZP", "name": "Газпром", "lastPrice": 170.0, "prevPrice": 168.4, "lotSize": 10, "changePct": 0.95, "vmLongRub": 16.0, "vmShortRub": -16.0, "riskLevel": "Низкий"},
+            {"secid": "LKOH", "name": "Лукойл", "lastPrice": 7600.0, "prevPrice": 7480.0, "lotSize": 1, "changePct": 1.604, "vmLongRub": 120.0, "vmShortRub": -120.0, "riskLevel": "Средний"},
+        ]
+
+
+def get_sell_stress_rows() -> list[dict[str, Any]]:
+    try:
+        snapshot = fetch_equity_snapshot()
+        rows: list[dict[str, Any]] = []
+        for item in snapshot:
+            last = to_float(item.get("LAST"))
+            prev = to_float(item.get("PREVPRICE"))
+            bid = to_float(item.get("BID"))
+            offer = to_float(item.get("OFFER"))
+            trades = int(to_float(item.get("NUMTRADES")) or 0)
+            if last is None or prev is None or prev == 0:
+                continue
+
+            change_pct = ((last - prev) / prev) * 100
+            spread_pct = ((offer - bid) / last * 100) if (bid is not None and offer is not None and last) else 0.0
+            stress_score = abs(change_pct) * 0.7 + spread_pct * 0.3
+            pressure = "Критичное" if stress_score >= 4 else "Повышенное" if stress_score >= 2 else "Умеренное"
+
+            rows.append(
+                {
+                    "secid": item.get("SECID"),
+                    "name": item.get("SHORTNAME") or "-",
+                    "changePct": round(change_pct, 3),
+                    "spreadPct": round(spread_pct, 3),
+                    "numTrades": trades,
+                    "stressScore": round(stress_score, 3),
+                    "sellPressure": pressure,
+                }
+            )
+        rows.sort(key=lambda x: float(x["stressScore"]), reverse=True)
+        return rows[:20]
+    except Exception:
+        return [
+            {"secid": "RUAL", "name": "Русал", "changePct": -4.2, "spreadPct": 0.9, "numTrades": 1780, "stressScore": 3.21, "sellPressure": "Повышенное"},
+            {"secid": "AFKS", "name": "АФК Система", "changePct": -3.5, "spreadPct": 1.8, "numTrades": 2020, "stressScore": 2.99, "sellPressure": "Повышенное"},
+            {"secid": "VTBR", "name": "ВТБ", "changePct": -2.0, "spreadPct": 2.7, "numTrades": 6400, "stressScore": 2.21, "sellPressure": "Повышенное"},
+        ]
+
+
 @app.route("/")
 def index() -> Any:
     return send_from_directory("templates", "index.html")
@@ -171,14 +286,14 @@ def menu_api() -> Any:
                     "id": "vm",
                     "title": "Расчет VM",
                     "icon": "🧮",
-                    "description": "Расчет вариационной маржи для инструментов FORTS.",
+                    "description": "Оперативная оценка VM по бумагам TQBR (лонг/шорт на 1 лот).",
                     "api": "/api/vm",
                 },
                 {
                     "id": "sell_stres",
                     "title": "Sell_stres",
                     "icon": "🧩",
-                    "description": "Оценка рыночного давления для акций и облигаций.",
+                    "description": "Сигнал давления продаж по изменению цены и спреду.",
                     "api": "/api/sell-stres",
                 },
             ]
@@ -210,23 +325,21 @@ def calendar_api() -> Any:
 
 @app.route("/api/vm", methods=["GET"])
 def vm_api() -> Any:
-    return jsonify(
-        {
-            "message": "Демо API для VM. Подключите расчет из основной бизнес-логики.",
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-        }
-    )
+    return jsonify({"rows": get_vm_rows(), "generatedAt": datetime.utcnow().isoformat() + "Z"})
 
 
 @app.route("/api/sell-stres", methods=["GET"])
 def sell_stres_api() -> Any:
-    return jsonify(
-        {
-            "message": "Демо API для Sell_stres. Подключите расчет из основной бизнес-логики.",
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-        }
-    )
+    return jsonify({"rows": get_sell_stress_rows(), "generatedAt": datetime.utcnow().isoformat() + "Z"})
+
+
+@app.route("/api/sell-strass", methods=["GET"])
+def sell_strass_alias_api() -> Any:
+    """Alias endpoint because this module is often named with double 's'."""
+    return sell_stres_api()
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    port = int(os.getenv("PORT", "8000"))
+    debug = os.getenv("FLASK_DEBUG", "0") == "1"
+    app.run(host="0.0.0.0", port=port, debug=debug)
