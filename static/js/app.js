@@ -117,7 +117,7 @@ function App() {
       const res = await fetch(url);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Ошибка API");
-      setRows([data]);
+      setRows(Array.isArray(data.rows) ? data.rows : [data]);
     } catch (e) {
       setError(e.message || "Сетевая ошибка");
     } finally {
