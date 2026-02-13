@@ -43,6 +43,8 @@ if "refresh_in_progress" not in st.session_state:
     st.session_state["refresh_in_progress"] = False
 if "global_http_gate" not in st.session_state:
     st.session_state["global_http_gate"] = 0.0
+if "last_http_error" not in st.session_state:
+    st.session_state["last_http_error"] = ""
 st.session_state["_rerun_id"] = st.session_state.get("_rerun_id", 0) + 1
 
 if hasattr(st, "autorefresh") and st.session_state["active_view"] != "home":
@@ -116,22 +118,33 @@ def get_session() -> requests.Session:
 def moex_request(url: str, params=None, timeout=(5, 20)):
     """Единая точка HTTP-запросов с таймаутами и обработкой ошибок."""
     try:
-        # Global throttle: не более 1 нового HTTP-запроса в секунду.
+        # Global throttle: не более 1 нового HTTP-запроса в секунду (без дропа запроса).
         now = time.time()
-        if now - st.session_state.get("global_http_gate", 0.0) < 1.0:
-            return None
+        elapsed = now - st.session_state.get("global_http_gate", 0.0)
+        if elapsed < 1.0:
+            time.sleep(1.0 - elapsed)
         st.session_state["global_http_gate"] = now
         response = get_session().get(url, params=params, timeout=timeout)
         response.raise_for_status()
+        st.session_state["last_http_error"] = ""
         return response
     except ConnectTimeout:
-        st.error("Превышено время установки соединения с MOEX (ConnectTimeout).")
+        msg = "Превышено время установки соединения с MOEX (ConnectTimeout)."
+        if st.session_state.get("last_http_error") != msg:
+            st.error(msg)
+            st.session_state["last_http_error"] = msg
         return None
     except ReadTimeout:
-        st.error("MOEX слишком долго отвечает (ReadTimeout).")
+        msg = "MOEX слишком долго отвечает (ReadTimeout)."
+        if st.session_state.get("last_http_error") != msg:
+            st.error(msg)
+            st.session_state["last_http_error"] = msg
         return None
     except RequestException as exc:
-        st.error(f"Ошибка запроса к MOEX: {exc}")
+        msg = f"Ошибка запроса к MOEX: {exc}"
+        if st.session_state.get("last_http_error") != msg:
+            st.error(msg)
+            st.session_state["last_http_error"] = msg
         return None
 
 
